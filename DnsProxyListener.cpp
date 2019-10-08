@@ -27,7 +27,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/types.h>
 
 #define LOG_TAG "resolv"
 
@@ -38,6 +37,7 @@
 #include <android-base/stringprintf.h>
 #include <android/multinetwork.h>  // ResNsendFlags
 #include <cutils/misc.h>           // FIRST_APPLICATION_UID
+#include <cutils/multiuser.h>
 #include <netdutils/InternetAddresses.h>
 #include <netdutils/OperationLimiter.h>
 #include <netdutils/ResponseCode.h>
@@ -117,18 +117,11 @@ constexpr bool requestingUseLocalNameservers(unsigned flags) {
     return (flags & NET_CONTEXT_FLAG_USE_LOCAL_NAMESERVERS) != 0;
 }
 
-inline bool queryingViaTls(unsigned dns_netid) {
-    // TODO: The simpler PrivateDnsStatus should suffice here.
-    ExternalPrivateDnsStatus privateDnsStatus = {PrivateDnsMode::OFF, 0, {}};
-    gPrivateDnsConfiguration.getStatus(dns_netid, &privateDnsStatus);
-    switch (static_cast<PrivateDnsMode>(privateDnsStatus.mode)) {
+bool queryingViaTls(unsigned dns_netid) {
+    const auto privateDnsStatus = gPrivateDnsConfiguration.getStatus(dns_netid);
+    switch (privateDnsStatus.mode) {
         case PrivateDnsMode::OPPORTUNISTIC:
-            for (int i = 0; i < privateDnsStatus.numServers; i++) {
-                if (privateDnsStatus.serverStatus[i].validation == Validation::success) {
-                    return true;
-                }
-            }
-            return false;
+            return !privateDnsStatus.validatedServers().empty();
         case PrivateDnsMode::STRICT:
             return true;
         default:
@@ -518,6 +511,11 @@ bool getDns64Prefix(unsigned netId, netdutils::IPPrefix* prefix) {
     return !gDnsResolv->resolverCtrl.getPrefix64(netId, prefix);
 }
 
+std::string makeThreadName(unsigned netId, uint32_t uid) {
+    // The maximum of netId and app_id are 5-digit numbers.
+    return android::base::StringPrintf("Dns_%u_%u", netId, multiuser_get_app_id(uid));
+}
+
 }  // namespace
 
 DnsProxyListener::DnsProxyListener() : FrameworkListener(SOCKET_NAME) {
@@ -713,6 +711,10 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
                    ip_addrs, total_ip_addr_count);
     freeaddrinfo(result);
     mClient->decRef();
+}
+
+std::string DnsProxyListener::GetAddrInfoHandler::threadName() {
+    return makeThreadName(mNetContext.dns_netid, mClient->getUid());
 }
 
 namespace {
@@ -933,6 +935,10 @@ void DnsProxyListener::ResNSendHandler::run() {
     }
 }
 
+std::string DnsProxyListener::ResNSendHandler::threadName() {
+    return makeThreadName(mNetContext.dns_netid, mClient->getUid());
+}
+
 namespace {
 
 bool sendCodeAndBe32(SocketClient* c, int code, int data) {
@@ -1107,6 +1113,9 @@ void DnsProxyListener::GetHostByNameHandler::run() {
     mClient->decRef();
 }
 
+std::string DnsProxyListener::GetHostByNameHandler::threadName() {
+    return makeThreadName(mNetContext.dns_netid, mClient->getUid());
+}
 
 /*******************************************************
  *                  GetHostByAddr                      *
@@ -1258,6 +1267,10 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
     reportDnsEvent(INetdEventListener::EVENT_GETHOSTBYADDR, mNetContext, latencyUs, rv, event,
                    (hp && hp->h_name) ? hp->h_name : "null", {}, 0);
     mClient->decRef();
+}
+
+std::string DnsProxyListener::GetHostByAddrHandler::threadName() {
+    return makeThreadName(mNetContext.dns_netid, mClient->getUid());
 }
 
 }  // namespace net

@@ -37,7 +37,6 @@
 #include "netd_resolv/stats.h"
 #include "resolv_cache.h"
 
-using namespace std::placeholders;
 using aidl::android::net::ResolverParamsParcel;
 
 namespace android {
@@ -179,7 +178,7 @@ ResolverController::ResolverController()
               [](uint32_t netId, uint32_t uid, android_net_context* netcontext) {
                   gResNetdCallbacks.get_network_context(netId, uid, netcontext);
               },
-              std::bind(sendNat64PrefixEvent, _1)) {}
+              std::bind(sendNat64PrefixEvent, std::placeholders::_1)) {}
 
 void ResolverController::destroyNetworkCache(unsigned netId) {
     LOG(VERBOSE) << __func__ << ": netId = " << netId;
@@ -227,8 +226,8 @@ int ResolverController::setResolverConfiguration(const ResolverParamsParcel& res
     res_params.base_timeout_msec = resolverParams.baseTimeoutMsec;
     res_params.retry_count = resolverParams.retryCount;
 
-    return -resolv_set_nameservers(resolverParams.netId, resolverParams.servers,
-                                   resolverParams.domains, res_params);
+    return resolv_set_nameservers(resolverParams.netId, resolverParams.servers,
+                                  resolverParams.domains, res_params);
 }
 
 int ResolverController::getResolverInfo(int32_t netId, std::vector<std::string>* servers,
@@ -249,11 +248,9 @@ int ResolverController::getResolverInfo(int32_t netId, std::vector<std::string>*
     // Serialize the information for binder.
     ResolverStats::encodeAll(res_stats, stats);
 
-    ExternalPrivateDnsStatus privateDnsStatus = {PrivateDnsMode::OFF, 0, {}};
-    gPrivateDnsConfiguration.getStatus(netId, &privateDnsStatus);
-    for (int i = 0; i < privateDnsStatus.numServers; i++) {
-        std::string tlsServer_str = addrToString(&(privateDnsStatus.serverStatus[i].ss));
-        tlsServers->push_back(std::move(tlsServer_str));
+    const auto privateDnsStatus = gPrivateDnsConfiguration.getStatus(netId);
+    for (const auto& pair : privateDnsStatus.serversMap) {
+        tlsServers->push_back(addrToString(&pair.first.ss));
     }
 
     params->resize(IDnsResolver::RESOLVER_PARAMS_COUNT);
@@ -344,20 +341,17 @@ void ResolverController::dump(DumpWriter& dw, unsigned netId) {
         }
 
         mDns64Configuration.dump(dw, netId);
-        ExternalPrivateDnsStatus privateDnsStatus = {PrivateDnsMode::OFF, 0, {}};
-        gPrivateDnsConfiguration.getStatus(netId, &privateDnsStatus);
+        const auto privateDnsStatus = gPrivateDnsConfiguration.getStatus(netId);
         dw.println("Private DNS mode: %s", getPrivateDnsModeString(privateDnsStatus.mode));
-        if (!privateDnsStatus.numServers) {
+        if (privateDnsStatus.serversMap.size() == 0) {
             dw.println("No Private DNS servers configured");
         } else {
-            dw.println("Private DNS configuration (%u entries)", privateDnsStatus.numServers);
+            dw.println("Private DNS configuration (%u entries)",
+                       static_cast<uint32_t>(privateDnsStatus.serversMap.size()));
             dw.incIndent();
-            for (int i = 0; i < privateDnsStatus.numServers; i++) {
-                dw.println("%s name{%s} status{%s}",
-                           addrToString(&(privateDnsStatus.serverStatus[i].ss)).c_str(),
-                           privateDnsStatus.serverStatus[i].hostname,
-                           validationStatusToString(static_cast<Validation>(
-                                   privateDnsStatus.serverStatus[i].validation)));
+            for (const auto& pair : privateDnsStatus.serversMap) {
+                dw.println("%s name{%s} status{%s}", addrToString(&pair.first.ss).c_str(),
+                           pair.first.name.c_str(), validationStatusToString(pair.second));
             }
             dw.decIndent();
         }
