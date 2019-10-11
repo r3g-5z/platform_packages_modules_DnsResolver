@@ -65,7 +65,6 @@
 #include "netd_resolv/params.h"
 #include "netd_resolv/resolv.h"
 #include "netd_resolv/stats.h"
-#include "resolv_static.h"
 #include "stats.pb.h"
 
 // Linux defines MAXHOSTNAMELEN as 64, while the domain name limit in
@@ -79,55 +78,32 @@
  * Global defines and variables for resolver stub.
  */
 #define RES_TIMEOUT 5000 /* min. milliseconds between retries */
-#define MAXRESOLVSORT 10  /* number of net to sort on */
-#define RES_MAXNDOTS 15   /* should reflect bit field size */
 #define RES_DFLRETRY 2    /* Default #/tries. */
-#define RES_MAXTIME 65535 /* Infinity, in milliseconds. */
 
-struct res_state_ext;
+// Holds either a sockaddr_in or a sockaddr_in6.
+union sockaddr_union {
+    struct sockaddr sa;
+    struct sockaddr_in sin;
+    struct sockaddr_in6 sin6;
+};
 
 struct __res_state {
     unsigned netid;                           // NetId: cache key and socket mark
     uid_t uid;                                // uid of the app that sent the DNS lookup
     int nscount;                              // number of name srvers
-    struct sockaddr_in nsaddr_list[MAXNS];    // address of name server
-#define nsaddr nsaddr_list[0]                 // for backward compatibility
     uint16_t id;                              // current message id
     std::vector<std::string> search_domains;  // domains to search
+    sockaddr_union nsaddrs[MAXNS];
+    int nssocks[MAXNS];                       // UDP sockets to nameservers
     unsigned ndots : 4;                       // threshold for initial abs. query
-    unsigned nsort : 4;                       // number of elements in sort_list[]
-    char unused[3];
-    struct {
-        struct in_addr addr;
-        uint32_t mask;
-    } sort_list[MAXRESOLVSORT];
-    unsigned _mark;       /* If non-0 SET_MARK to _mark on all request sockets */
-    int _vcsock;          /* PRIVATE: for res_send VC i/o */
-    uint32_t _flags;      /* PRIVATE: see below */
-    uint32_t _pad;        /* make _u 64 bit aligned */
-    union {
-        /* On an 32-bit arch this means 512b total. */
-        char pad[72 - 4 * sizeof(int) - 2 * sizeof(void*)];
-        struct {
-            uint16_t nscount;
-            uint16_t nstimes[MAXNS]; /* ms. */
-            int nssocks[MAXNS];
-            struct res_state_ext* ext; /* extention for IPv6 */
-        } _ext;
-    } _u;
-    struct res_static rstatic[1];
+    unsigned _mark;                           // If non-0 SET_MARK to _mark on all request sockets
+    int _vcsock;                              // TCP socket (but why not one per nameserver?)
+    uint32_t _flags;                          // See RES_F_* defines below
     android::net::NetworkDnsEventReported* event;
     uint32_t netcontext_flags;
 };
 
 typedef struct __res_state* res_state;
-
-// Holds either a sockaddr_in or a sockaddr_in6.
-typedef union sockaddr_union {
-    struct sockaddr sa;
-    struct sockaddr_in sin;
-    struct sockaddr_in6 sin6;
-} sockaddr_union;
 
 /* Retrieve a local copy of the stats for the given netid. The buffer must have space for
  * MAXNS __resolver_stats. Returns the revision id of the resolvers used.
@@ -177,8 +153,6 @@ void putshort(uint16_t, uint8_t*);
 
 int res_nameinquery(const char*, int, int, const uint8_t*, const uint8_t*);
 int res_queriesmatch(const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*);
-/* Things involving a resolver context. */
-int res_ninit(res_state);
 
 int res_nquery(res_state, const char*, int, int, uint8_t*, int, int*);
 int res_nsearch(res_state, const char*, int, int, uint8_t*, int, int*);
@@ -188,11 +162,8 @@ int res_nmkquery(res_state, int, const char*, int, int, const uint8_t*, int, con
 int res_nsend(res_state, const uint8_t*, int, uint8_t*, int, int*, uint32_t);
 void res_nclose(res_state);
 int res_nopt(res_state, int, uint8_t*, int, int);
-void res_ndestroy(res_state);
-void res_setservers(res_state, const sockaddr_union*, int);
-int res_getservers(res_state, sockaddr_union*, int);
 
-struct android_net_context; /* forward */
+struct android_net_context;
 void res_setnetcontext(res_state, const struct android_net_context*,
                        android::net::NetworkDnsEventReported* event);
 

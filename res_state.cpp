@@ -38,8 +38,10 @@
 
 #include <android-base/logging.h>
 
+#include "res_init.h"
 #include "resolv_cache.h"
 #include "resolv_private.h"
+#include "resolv_static.h"
 
 typedef struct {
     // TODO: Have one __res_state per network so we don't have to repopulate frequently.
@@ -74,7 +76,7 @@ static void res_thread_free(void* _rt) {
     LOG(VERBOSE) << __func__ << ": rt=" << rt << " for thread=" << gettid();
 
     res_static_done(rt->_rstatic);
-    res_ndestroy(rt->_nres);
+    res_nclose(rt->_nres);
     free(rt);
 }
 
@@ -99,14 +101,7 @@ static _res_thread* res_thread_get(void) {
     pthread_setspecific(_res_key, rt);
 
     LOG(VERBOSE) << __func__ << ": tid=" << gettid() << ", rt=" << rt;
-    if (res_ninit(rt->_nres) < 0) {
-        /* This should not happen */
-        LOG(VERBOSE) << __func__ << ": tid=" << gettid() << " rt=" << rt
-                     << ", res_ninit() returned < 0";
-        res_thread_free(rt);
-        pthread_setspecific(_res_key, NULL);
-        return NULL;
-    }
+    res_init(rt->_nres);
     return rt;
 }
 
