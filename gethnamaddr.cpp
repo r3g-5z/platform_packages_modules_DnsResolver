@@ -67,7 +67,6 @@
 #include <string.h>
 #include <sys/param.h>
 #include <sys/socket.h>
-#include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <functional>
@@ -99,7 +98,7 @@ using android::net::NetworkDnsEventReported;
 
 typedef union {
     HEADER hdr;
-    u_char buf[MAXPACKET];
+    uint8_t buf[MAXPACKET];
 } querybuf;
 
 typedef union {
@@ -107,13 +106,10 @@ typedef union {
     char ac;
 } align;
 
-static struct hostent* getanswer(const querybuf*, int, const char*, int, res_state, struct hostent*,
-                                 char*, size_t, int*);
 static void convert_v4v6_hostent(struct hostent* hp, char** bpp, char* ep,
-                                 std::function<void(struct hostent* hp)> mapping_param,
-                                 std::function<void(char* src, char* dst)> mapping_addr);
+                                 const std::function<void(struct hostent* hp)>& mapping_param,
+                                 const std::function<void(char* src, char* dst)>& mapping_addr);
 static void pad_v4v6_hostent(struct hostent* hp, char** bpp, char* ep);
-static void addrsort(char**, int, res_state);
 
 static int dns_gethtbyaddr(const unsigned char* uaddr, int len, int af,
                            const android_net_context* netcontext, getnamaddr* info,
@@ -146,13 +142,12 @@ static int android_gethostbyaddrfornetcontext_proxy(const void* addr, socklen_t 
     } while (0)
 
 static struct hostent* getanswer(const querybuf* answer, int anslen, const char* qname, int qtype,
-                                 res_state res, struct hostent* hent, char* buf, size_t buflen,
-                                 int* he) {
+                                 struct hostent* hent, char* buf, size_t buflen, int* he) {
     const HEADER* hp;
-    const u_char* cp;
+    const uint8_t* cp;
     int n;
     size_t qlen;
-    const u_char *eom, *erdata;
+    const uint8_t *eom, *erdata;
     char *bp, **hap, *ep;
     int ancount, qdcount;
     int haveanswer, had_error;
@@ -344,7 +339,7 @@ static struct hostent* getanswer(const querybuf* answer, int anslen, const char*
                     bp += nn;
                 }
 
-                bp += sizeof(align) - (size_t)((u_long) bp % sizeof(align));
+                bp += sizeof(align) - (size_t)((uintptr_t)bp % sizeof(align));
 
                 if (bp + n >= ep) {
                     LOG(DEBUG) << __func__ << ": size (" << n << ") too big";
@@ -370,12 +365,6 @@ static struct hostent* getanswer(const querybuf* answer, int anslen, const char*
     }
     if (haveanswer) {
         *hap = NULL;
-        /*
-         * Note: we sort even if host can take only one address
-         * in its return structures - should give it the "best"
-         * address in that case, not some random one
-         */
-        if (res->nsort && haveanswer > 1 && qtype == T_A) addrsort(addr_ptrs, haveanswer, res);
         if (!hent->h_name) {
             n = (int) strlen(qname) + 1; /* for the \0 */
             if (n > ep - bp || n >= MAXHOSTNAMELEN) goto no_recovery;
@@ -437,7 +426,7 @@ static int gethostbyname_internal_real(const char* name, int af, hostent* hp, ch
      * disallow names consisting only of digits/dots, unless
      * they end in a dot.
      */
-    if (isdigit((u_char) name[0])) {
+    if (isdigit((uint8_t)name[0])) {
         for (const char* cp = name;; ++cp) {
             if (!*cp) {
                 if (*--cp == '.') break;
@@ -448,10 +437,10 @@ static int gethostbyname_internal_real(const char* name, int af, hostent* hp, ch
                  */
                 goto fake;
             }
-            if (!isdigit((u_char) *cp) && *cp != '.') break;
+            if (!isdigit((uint8_t)*cp) && *cp != '.') break;
         }
     }
-    if ((isxdigit((u_char) name[0]) && strchr(name, ':') != NULL) || name[0] == ':') {
+    if ((isxdigit((uint8_t)name[0]) && strchr(name, ':') != NULL) || name[0] == ':') {
         for (const char* cp = name;; ++cp) {
             if (!*cp) {
                 if (*--cp == '.') break;
@@ -462,7 +451,7 @@ static int gethostbyname_internal_real(const char* name, int af, hostent* hp, ch
                  */
                 goto fake;
             }
-            if (!isxdigit((u_char) *cp) && *cp != ':' && *cp != '.') break;
+            if (!isxdigit((uint8_t)*cp) && *cp != ':' && *cp != '.') break;
         }
     }
 
@@ -506,7 +495,7 @@ static int android_gethostbyaddrfornetcontext_real(const void* addr, socklen_t l
                                                    struct hostent* hp, char* buf, size_t buflen,
                                                    const struct android_net_context* netcontext,
                                                    NetworkDnsEventReported* event) {
-    const u_char* uaddr = (const u_char*) addr;
+    const uint8_t* uaddr = (const uint8_t*)addr;
     socklen_t size;
     struct getnamaddr info;
 
@@ -656,10 +645,9 @@ nospc:
     return NULL;
 }
 
-
 static void convert_v4v6_hostent(struct hostent* hp, char** bpp, char* ep,
-                                 std::function<void(struct hostent* hp)> map_param,
-                                 std::function<void(char* src, char* dst)> map_addr) {
+                                 const std::function<void(struct hostent* hp)>& map_param,
+                                 const std::function<void(char* src, char* dst)>& map_addr) {
     _DIAGASSERT(hp != NULL);
     _DIAGASSERT(bpp != NULL);
     _DIAGASSERT(ep != NULL);
@@ -667,7 +655,7 @@ static void convert_v4v6_hostent(struct hostent* hp, char** bpp, char* ep,
     if (hp->h_addrtype != AF_INET || hp->h_length != NS_INADDRSZ) return;
     map_param(hp);
     for (char** ap = hp->h_addr_list; *ap; ap++) {
-        int i = (int) (sizeof(align) - (size_t)((u_long) *bpp % sizeof(align)));
+        int i = (int)(sizeof(align) - (size_t)((uintptr_t)*bpp % sizeof(align)));
 
         if (ep - *bpp < (i + NS_IN6ADDRSZ)) {
             /* Out of memory.  Truncate address list here.  XXX */
@@ -691,44 +679,6 @@ static void pad_v4v6_hostent(struct hostent* hp, char** bpp, char* ep) {
                              memcpy(dst, src, NS_INADDRSZ);
                              memcpy(dst + NS_INADDRSZ, NAT64_PAD, sizeof(NAT64_PAD));
                          });
-}
-
-static void addrsort(char** ap, int num, res_state res) {
-    int i, j;
-    char** p;
-    short aval[MAXADDRS];
-    int needsort = 0;
-
-    _DIAGASSERT(ap != NULL);
-
-    p = ap;
-    for (i = 0; i < num; i++, p++) {
-        for (j = 0; (unsigned) j < res->nsort; j++)
-            if (res->sort_list[j].addr.s_addr ==
-                (((struct in_addr*) (void*) (*p))->s_addr & res->sort_list[j].mask))
-                break;
-        aval[i] = j;
-        if (needsort == 0 && i > 0 && j < aval[i - 1]) needsort = i;
-    }
-    if (!needsort) return;
-
-    while (needsort < num) {
-        for (j = needsort - 1; j >= 0; j--) {
-            if (aval[j] > aval[j + 1]) {
-                char* hp;
-
-                i = aval[j];
-                aval[j] = aval[j + 1];
-                aval[j + 1] = i;
-
-                hp = ap[j];
-                ap[j] = ap[j + 1];
-                ap[j + 1] = hp;
-            } else
-                break;
-        }
-        needsort++;
-    }
 }
 
 static int dns_gethtbyname(const char* name, int addr_type, getnamaddr* info) {
@@ -761,7 +711,7 @@ static int dns_gethtbyname(const char* name, int addr_type, getnamaddr* info) {
         // See also herrnoToAiErrno().
         return herrnoToAiErrno(he);
     }
-    hostent* hp = getanswer(buf.get(), n, name, type, res, info->hp, info->buf, info->buflen, &he);
+    hostent* hp = getanswer(buf.get(), n, name, type, info->hp, info->buf, info->buflen, &he);
     if (hp == NULL) return herrnoToAiErrno(he);
 
     return 0;
@@ -826,7 +776,7 @@ static int dns_gethtbyaddr(const unsigned char* uaddr, int len, int af,
         // See also herrnoToAiErrno().
         return herrnoToAiErrno(he);
     }
-    hostent* hp = getanswer(buf.get(), n, qbuf, T_PTR, res, info->hp, info->buf, info->buflen, &he);
+    hostent* hp = getanswer(buf.get(), n, qbuf, T_PTR, info->hp, info->buf, info->buflen, &he);
     if (hp == NULL) return herrnoToAiErrno(he);
 
     char* bf = (char*) (hp->h_addr_list + 2);
