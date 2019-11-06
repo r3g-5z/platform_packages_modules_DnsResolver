@@ -12,11 +12,24 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
  */
-#pragma once
 
-#include "resolv_private.h"
+#include "util.h"
 
-// TODO: make this a constructor for ResState
-void res_init(ResState* res, const struct android_net_context* netcontext,
-              android::net::NetworkDnsEventReported* event);
+socklen_t sockaddrSize(const sockaddr* sa) {
+    if (sa == nullptr) return 0;
+
+    switch (sa->sa_family) {
+        case AF_INET:
+            return sizeof(sockaddr_in);
+        case AF_INET6:
+            return sizeof(sockaddr_in6);
+        default:
+            return 0;
+    }
+}
+
+socklen_t sockaddrSize(const sockaddr_storage& ss) {
+    return sockaddrSize(reinterpret_cast<const sockaddr*>(&ss));
+}

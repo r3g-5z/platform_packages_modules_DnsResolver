@@ -12,11 +12,12 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
  */
+
 #pragma once
 
-#include "resolv_private.h"
+#include <netinet/in.h>
 
-// TODO: make this a constructor for ResState
-void res_init(ResState* res, const struct android_net_context* netcontext,
-              android::net::NetworkDnsEventReported* event);
+socklen_t sockaddrSize(const sockaddr* sa);
+socklen_t sockaddrSize(const sockaddr_storage& ss);

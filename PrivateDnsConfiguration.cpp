@@ -28,6 +28,7 @@
 #include "ResolverEventReporter.h"
 #include "netd_resolv/resolv.h"
 #include "netdutils/BackoffSequence.h"
+#include "resolv_cache.h"
 
 using std::chrono::milliseconds;
 
@@ -95,6 +96,8 @@ int PrivateDnsConfiguration::set(int32_t netId, uint32_t mark,
     } else {
         mPrivateDnsModes[netId] = PrivateDnsMode::OFF;
         mPrivateDnsTransports.erase(netId);
+        resolv_stats_set_servers_for_dot(netId, {});
+        mPrivateDnsValidateThreads.erase(netId);
         return 0;
     }
 
@@ -126,7 +129,8 @@ int PrivateDnsConfiguration::set(int32_t netId, uint32_t mark,
             validatePrivateDnsProvider(server, tracker, netId, mark);
         }
     }
-    return 0;
+
+    return resolv_stats_set_servers_for_dot(netId, servers);
 }
 
 PrivateDnsStatus PrivateDnsConfiguration::getStatus(unsigned netId) {
@@ -152,6 +156,7 @@ void PrivateDnsConfiguration::clear(unsigned netId) {
     std::lock_guard guard(mPrivateDnsLock);
     mPrivateDnsModes.erase(netId);
     mPrivateDnsTransports.erase(netId);
+    mPrivateDnsValidateThreads.erase(netId);
 }
 
 void PrivateDnsConfiguration::validatePrivateDnsProvider(const DnsTlsServer& server,
@@ -160,6 +165,10 @@ void PrivateDnsConfiguration::validatePrivateDnsProvider(const DnsTlsServer& ser
     tracker[server] = Validation::in_process;
     LOG(DEBUG) << "Server " << addrToString(&server.ss) << " marked as in_process on netId "
                << netId << ". Tracker now has size " << tracker.size();
+    // This judge must be after "tracker[server] = Validation::in_process;"
+    if (!needValidateThread(server, netId)) {
+        return;
+    }
 
     // Note that capturing |server| and |netId| in this lambda create copies.
     std::thread validate_thread([this, server, netId, mark] {
@@ -202,6 +211,7 @@ void PrivateDnsConfiguration::validatePrivateDnsProvider(const DnsTlsServer& ser
                 break;
             }
         }
+        this->cleanValidateThreadTracker(server, netId);
     });
     validate_thread.detach();
 }
@@ -274,6 +284,50 @@ bool PrivateDnsConfiguration::recordPrivateDnsValidation(const DnsTlsServer& ser
     LOG(WARNING) << "Validation " << (success ? "success" : "failed");
 
     return reevaluationStatus;
+}
+
+bool PrivateDnsConfiguration::needValidateThread(const DnsTlsServer& server, unsigned netId)
+        REQUIRES(mPrivateDnsLock) {
+    // Create the thread tracker if it was not present
+    auto threadPair = mPrivateDnsValidateThreads.find(netId);
+    if (threadPair == mPrivateDnsValidateThreads.end()) {
+        // No thread tracker yet for this netId.
+        bool added;
+        std::tie(threadPair, added) = mPrivateDnsValidateThreads.emplace(netId, ThreadTracker());
+        if (!added) {
+            LOG(ERROR) << "Memory error while needValidateThread for netId " << netId;
+            return true;
+        }
+    }
+    auto& threadTracker = threadPair->second;
+    if (threadTracker.count(server)) {
+        LOG(DEBUG) << "Server " << addrToString(&(server.ss))
+                   << " validate thread is already running. Thread tracker now has size "
+                   << threadTracker.size();
+        return false;
+    } else {
+        threadTracker.insert(server);
+        LOG(DEBUG) << "Server " << addrToString(&(server.ss))
+                   << " validate thread is not running. Thread tracker now has size "
+                   << threadTracker.size();
+        return true;
+    }
+}
+
+void PrivateDnsConfiguration::cleanValidateThreadTracker(const DnsTlsServer& server,
+                                                         unsigned netId) {
+    std::lock_guard<std::mutex> guard(mPrivateDnsLock);
+    LOG(DEBUG) << "cleanValidateThreadTracker Server " << addrToString(&(server.ss))
+               << " validate thread is stopped.";
+
+    auto threadPair = mPrivateDnsValidateThreads.find(netId);
+    if (threadPair != mPrivateDnsValidateThreads.end()) {
+        auto& threadTracker = threadPair->second;
+        threadTracker.erase(server);
+        LOG(DEBUG) << "Server " << addrToString(&(server.ss))
+                   << " validate thread is stopped. Thread tracker now has size "
+                   << threadTracker.size();
+    }
 }
 
 // Start validation for newly added servers as well as any servers that have

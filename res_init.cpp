@@ -92,24 +92,27 @@
 #include "netd_resolv/resolv.h"
 #include "resolv_private.h"
 
-// Set up Resolver state default settings.
-// Note: this is called with statp zero-initialized
-void res_init(res_state statp) {
-    statp->netid = NETID_UNSET;
+void res_init(ResState* statp, const struct android_net_context* _Nonnull netcontext,
+              android::net::NetworkDnsEventReported* _Nonnull event) {
+    memset(statp, 0, sizeof *statp);
+
+    statp->netid = netcontext->dns_netid;
+    statp->uid = netcontext->uid;
+    statp->pid = netcontext->pid;
     statp->id = arc4random_uniform(65536);
-    statp->_mark = MARK_UNSET;
+    statp->_mark = netcontext->dns_mark;
+    statp->netcontext_flags = netcontext->flags;
+    statp->event = event;
 
     statp->ndots = 1;
     statp->_vcsock = -1;
-    statp->_flags = 0;
-    statp->netcontext_flags = 0;
 
     for (int ns = 0; ns < MAXNS; ns++) {
         statp->nssocks[ns] = -1;
     }
 
     // The following dummy initialization is probably useless because
-    // it's overwritten later by _resolv_populate_res_for_net().
+    // it's overwritten later by resolv_populate_res_for_net().
     // TODO: check if it's safe to remove.
     const sockaddr_union u{
             .sin.sin_addr.s_addr = INADDR_ANY,
@@ -140,16 +143,5 @@ void res_nclose(res_state statp) {
             close(statp->nssocks[ns]);
             statp->nssocks[ns] = -1;
         }
-    }
-}
-
-void res_setnetcontext(res_state statp, const struct android_net_context* netcontext,
-                       android::net::NetworkDnsEventReported* _Nonnull event) {
-    if (statp != nullptr) {
-        statp->netid = netcontext->dns_netid;
-        statp->uid = netcontext->uid;
-        statp->_mark = netcontext->dns_mark;
-        statp->netcontext_flags = netcontext->flags;
-        statp->event = event;
     }
 }
