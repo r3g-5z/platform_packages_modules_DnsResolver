@@ -83,7 +83,6 @@
 
 #include <arpa/inet.h>
 #include <arpa/nameser.h>
-#include <netinet/in.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -110,6 +109,7 @@
 #include "res_init.h"
 #include "resolv_cache.h"
 #include "stats.pb.h"
+#include "util.h"
 
 // TODO: use the namespace something like android::netd_resolv for libnetd_resolv
 using android::net::CacheStatus;
@@ -136,7 +136,6 @@ using android::netdutils::Stopwatch;
 
 static DnsTlsDispatcher sDnsTlsDispatcher;
 
-static int get_salen(const struct sockaddr*);
 static struct sockaddr* get_nsaddr(res_state, size_t);
 static int send_vc(res_state, res_params* params, const uint8_t*, int, uint8_t*, int, int*, int,
                    time_t*, int*, int*);
@@ -398,24 +397,20 @@ static DnsQueryEvent* addDnsQueryEvent(NetworkDnsEventReported* event) {
 
 int res_nsend(res_state statp, const uint8_t* buf, int buflen, uint8_t* ans, int anssiz, int* rcode,
               uint32_t flags) {
-    int gotsomewhere, terrno, v_circuit, resplen, n;
-    ResolvCacheStatus cache_status = RESOLV_CACHE_UNSUPPORTED;
+    LOG(DEBUG) << __func__;
 
+    // Should not happen
     if (anssiz < HFIXEDSZ) {
         // TODO: Remove errno once callers stop using it
         errno = EINVAL;
         return -EINVAL;
     }
-    LOG(DEBUG) << __func__;
     res_pquery(buf, buflen);
-
-    v_circuit = buflen > PACKETSZ;
-    gotsomewhere = 0;
-    terrno = ETIMEDOUT;
 
     int anslen = 0;
     Stopwatch cacheStopwatch;
-    cache_status = resolv_cache_lookup(statp->netid, buf, buflen, ans, anssiz, &anslen, flags);
+    ResolvCacheStatus cache_status =
+            resolv_cache_lookup(statp->netid, buf, buflen, ans, anssiz, &anslen, flags);
     const int32_t cacheLatencyUs = saturate_cast<int32_t>(cacheStopwatch.timeTakenUs());
     if (cache_status == RESOLV_CACHE_FOUND) {
         HEADER* hp = (HEADER*)(void*)ans;
@@ -427,7 +422,7 @@ int res_nsend(res_state statp, const uint8_t* buf, int buflen, uint8_t* ans, int
     } else if (cache_status != RESOLV_CACHE_UNSUPPORTED) {
         // had a cache miss for a known network, so populate the thread private
         // data so the normal resolve path can do its thing
-        _resolv_populate_res_for_net(statp);
+        resolv_populate_res_for_net(statp);
     }
     if (statp->nscount == 0) {
         // We have no nameservers configured, so there's no point trying.
@@ -443,8 +438,8 @@ int res_nsend(res_state statp, const uint8_t* buf, int buflen, uint8_t* ans, int
     // DoT
     if (!(statp->netcontext_flags & NET_CONTEXT_FLAG_USE_LOCAL_NAMESERVERS)) {
         bool fallback = false;
-        resplen = res_tls_send(statp, Slice(const_cast<uint8_t*>(buf), buflen), Slice(ans, anssiz),
-                               rcode, &fallback);
+        int resplen = res_tls_send(statp, Slice(const_cast<uint8_t*>(buf), buflen),
+                                   Slice(ans, anssiz), rcode, &fallback);
         if (resplen > 0) {
             LOG(DEBUG) << __func__ << ": got answer from DoT";
             res_pquery(ans, resplen);
@@ -455,7 +450,7 @@ int res_nsend(res_state statp, const uint8_t* buf, int buflen, uint8_t* ans, int
         }
         if (!fallback) {
             _resolv_cache_query_failed(statp->netid, buf, buflen, flags);
-            return -terrno;
+            return -ETIMEDOUT;
         }
     }
 
@@ -479,108 +474,79 @@ int res_nsend(res_state statp, const uint8_t* buf, int buflen, uint8_t* ans, int
         res_set_usable_server(selectedServer, statp->nscount, usable_servers);
     }
 
-    /*
-     * Send request, RETRY times, or until successful.
-     */
+    // Send request, RETRY times, or until successful.
     int retryTimes = (flags & ANDROID_RESOLV_NO_RETRY) ? 1 : params.retry_count;
+    int useTcp = buflen > PACKETSZ;
+    int gotsomewhere = 0;
+    int terrno = ETIMEDOUT;
 
     for (int attempt = 0; attempt < retryTimes; ++attempt) {
-
-        for (int ns = 0; ns < statp->nscount; ns++) {
+        for (int ns = 0; ns < statp->nscount; ++ns) {
             if (!usable_servers[ns]) continue;
-            int nsaplen;
-            time_t now = 0;
-            int delay = 0;
-            *rcode = RCODE_INTERNAL_ERROR;
-            const sockaddr* nsap = get_nsaddr(statp, ns);
-            nsaplen = get_salen(nsap);
 
-        same_ns:
+            *rcode = RCODE_INTERNAL_ERROR;
+
+            // Get server addr
+            const sockaddr* nsap = get_nsaddr(statp, ns);
+            const int nsaplen = sockaddrSize(nsap);
+
             static const int niflags = NI_NUMERICHOST | NI_NUMERICSERV;
             char abuf[NI_MAXHOST];
-            DnsQueryEvent* dnsQueryEvent = addDnsQueryEvent(statp->event);
-            dnsQueryEvent->set_cache_hit(static_cast<CacheStatus>(cache_status));
-
             if (getnameinfo(nsap, (socklen_t)nsaplen, abuf, sizeof(abuf), NULL, 0, niflags) == 0)
                 LOG(DEBUG) << __func__ << ": Querying server (# " << ns + 1
                            << ") address = " << abuf;
 
+            ::android::net::Protocol query_proto = useTcp ? PROTO_TCP : PROTO_UDP;
+            time_t now = 0;
+            int delay = 0;
+            bool fallbackTCP = false;
+            const bool shouldRecordStats = (attempt == 0);
+            int resplen;
             Stopwatch queryStopwatch;
-            if (v_circuit) {
-                /* Use VC; at most one attempt per server. */
-                bool shouldRecordStats = (attempt == 0);
+            if (useTcp) {
+                // TCP; at most one attempt per server.
                 attempt = retryTimes;
-
-                n = send_vc(statp, &params, buf, buflen, ans, anssiz, &terrno, ns, &now, rcode,
-                            &delay);
-
-                dnsQueryEvent->set_latency_micros(
-                        saturate_cast<int32_t>(queryStopwatch.timeTakenUs()));
-                dnsQueryEvent->set_dns_server_index(ns);
-                dnsQueryEvent->set_ip_version(ipFamilyToIPVersion(nsap->sa_family));
-                dnsQueryEvent->set_retry_times(attempt);
-                dnsQueryEvent->set_rcode(static_cast<NsRcode>(*rcode));
-                dnsQueryEvent->set_protocol(PROTO_TCP);
-                dnsQueryEvent->set_type(getQueryType(buf, buflen));
-
-                /*
-                 * Only record stats the first time we try a query. This ensures that
-                 * queries that deterministically fail (e.g., a name that always returns
-                 * SERVFAIL or times out) do not unduly affect the stats.
-                 */
-                if (shouldRecordStats) {
-                    res_sample sample;
-                    _res_stats_set_sample(&sample, now, *rcode, delay);
-                    _resolv_cache_add_resolver_stats_sample(statp->netid, revision_id, ns, &sample,
-                                                            params.max_samples);
-                    resolv_stats_add(statp->netid, IPSockAddr::toIPSockAddr(*nsap), dnsQueryEvent);
-                }
-
-                LOG(INFO) << __func__ << ": used send_vc " << n;
-
-                if (n < 0) {
-                    _resolv_cache_query_failed(statp->netid, buf, buflen, flags);
-                    res_nclose(statp);
-                    return -terrno;
-                };
-                if (n == 0) goto next_ns;
-                resplen = n;
+                resplen = send_vc(statp, &params, buf, buflen, ans, anssiz, &terrno, ns, &now,
+                                  rcode, &delay);
             } else {
-                /* Use datagrams. */
-                LOG(INFO) << __func__ << ": using send_dg";
-
-                n = send_dg(statp, &params, buf, buflen, ans, anssiz, &terrno, ns, &v_circuit,
-                            &gotsomewhere, &now, rcode, &delay);
-
-                dnsQueryEvent->set_latency_micros(
-                        saturate_cast<int32_t>(queryStopwatch.timeTakenUs()));
-                dnsQueryEvent->set_dns_server_index(ns);
-                dnsQueryEvent->set_ip_version(ipFamilyToIPVersion(nsap->sa_family));
-                dnsQueryEvent->set_retry_times(attempt);
-                dnsQueryEvent->set_rcode(static_cast<NsRcode>(*rcode));
-                dnsQueryEvent->set_protocol(PROTO_UDP);
-                dnsQueryEvent->set_type(getQueryType(buf, buflen));
-
-                /* Only record stats the first time we try a query. See above. */
-                if (attempt == 0) {
-                    res_sample sample;
-                    _res_stats_set_sample(&sample, now, *rcode, delay);
-                    _resolv_cache_add_resolver_stats_sample(statp->netid, revision_id, ns, &sample,
-                                                            params.max_samples);
-                    resolv_stats_add(statp->netid, IPSockAddr::toIPSockAddr(*nsap), dnsQueryEvent);
-                }
-
-                LOG(INFO) << __func__ << ": used send_dg " << n;
-
-                if (n < 0) {
-                    _resolv_cache_query_failed(statp->netid, buf, buflen, flags);
-                    res_nclose(statp);
-                    return -terrno;
-                };
-                if (n == 0) goto next_ns;
-                if (v_circuit) goto same_ns;
-                resplen = n;
+                // UDP
+                resplen = send_dg(statp, &params, buf, buflen, ans, anssiz, &terrno, ns, &useTcp,
+                                  &gotsomewhere, &now, rcode, &delay);
+                fallbackTCP = useTcp ? true : false;
             }
+            LOG(INFO) << __func__ << ": used send_" << ((useTcp) ? "vc " : "dg ") << resplen;
+
+            DnsQueryEvent* dnsQueryEvent = addDnsQueryEvent(statp->event);
+            dnsQueryEvent->set_cache_hit(static_cast<CacheStatus>(cache_status));
+            dnsQueryEvent->set_latency_micros(saturate_cast<int32_t>(queryStopwatch.timeTakenUs()));
+            dnsQueryEvent->set_dns_server_index(ns);
+            dnsQueryEvent->set_ip_version(ipFamilyToIPVersion(nsap->sa_family));
+            dnsQueryEvent->set_retry_times(attempt);
+            dnsQueryEvent->set_rcode(static_cast<NsRcode>(*rcode));
+            dnsQueryEvent->set_protocol(query_proto);
+            dnsQueryEvent->set_type(getQueryType(buf, buflen));
+
+            // Only record stats the first time we try a query. This ensures that
+            // queries that deterministically fail (e.g., a name that always returns
+            // SERVFAIL or times out) do not unduly affect the stats.
+            if (shouldRecordStats) {
+                res_sample sample;
+                _res_stats_set_sample(&sample, now, *rcode, delay);
+                resolv_cache_add_resolver_stats_sample(statp->netid, revision_id, nsap, sample,
+                                                       params.max_samples);
+                resolv_stats_add(statp->netid, IPSockAddr::toIPSockAddr(*nsap), dnsQueryEvent);
+            }
+
+            if (resplen == 0) continue;
+            if (fallbackTCP) {
+                ns--;
+                continue;
+            }
+            if (resplen < 0) {
+                _resolv_cache_query_failed(statp->netid, buf, buflen, flags);
+                res_nclose(statp);
+                return -terrno;
+            };
 
             LOG(DEBUG) << __func__ << ": got answer:";
             res_pquery(ans, (resplen > anssiz) ? anssiz : resplen);
@@ -590,37 +556,20 @@ int res_nsend(res_state statp, const uint8_t* buf, int buflen, uint8_t* ans, int
             }
             res_nclose(statp);
             return (resplen);
-        next_ns:;
         }  // for each ns
     }  // for each retry
     res_nclose(statp);
-    if (!v_circuit) {
-        if (!gotsomewhere) {
-            // TODO: Remove errno once callers stop using it
-            errno = ECONNREFUSED; /* no nameservers found */
-            terrno = ECONNREFUSED;
-        } else {
-            // TODO: Remove errno once callers stop using it
-            errno = ETIMEDOUT; /* no answer obtained */
-            terrno = ETIMEDOUT;
-        }
-    } else {
-        errno = terrno;
-    }
+    terrno = useTcp ? terrno : gotsomewhere ? ETIMEDOUT : ECONNREFUSED;
+    // TODO: Remove errno once callers stop using it
+    errno = useTcp ? terrno
+                   : gotsomewhere ? ETIMEDOUT /* no answer obtained */
+                                  : ECONNREFUSED /* no nameservers found */;
+
     _resolv_cache_query_failed(statp->netid, buf, buflen, flags);
     return -terrno;
 }
 
 /* Private */
-
-static int get_salen(const struct sockaddr* sa) {
-    if (sa->sa_family == AF_INET)
-        return (sizeof(struct sockaddr_in));
-    else if (sa->sa_family == AF_INET6)
-        return (sizeof(struct sockaddr_in6));
-    else
-        return (0); /* unknown, die on connect */
-}
 
 static struct sockaddr* get_nsaddr(res_state statp, size_t n) {
     return (struct sockaddr*)(void*)&statp->nsaddrs[n];
@@ -662,7 +611,7 @@ static int send_vc(res_state statp, res_params* params, const uint8_t* buf, int 
     LOG(INFO) << __func__ << ": using send_vc";
 
     nsap = get_nsaddr(statp, (size_t) ns);
-    nsaplen = get_salen(nsap);
+    nsaplen = sockaddrSize(nsap);
 
     connreset = 0;
 same_ns:
@@ -930,7 +879,7 @@ static int send_dg(res_state statp, res_params* params, const uint8_t* buf, int 
     int resplen, n, s;
 
     nsap = get_nsaddr(statp, (size_t) ns);
-    nsaplen = get_salen(nsap);
+    nsaplen = sockaddrSize(nsap);
     if (statp->nssocks[ns] == -1) {
         statp->nssocks[ns] = socket(nsap->sa_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
         if (statp->nssocks[ns] < 0) {
@@ -1234,7 +1183,7 @@ int resolv_res_nsend(const android_net_context* netContext, const uint8_t* msg, 
     assert(event != nullptr);
     ResState res;
     res_init(&res, netContext, event);
-    _resolv_populate_res_for_net(&res);
+    resolv_populate_res_for_net(&res);
     *rcode = NOERROR;
     return res_nsend(&res, msg, msgLen, ans, ansLen, rcode, flags);
 }

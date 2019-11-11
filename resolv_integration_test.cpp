@@ -33,6 +33,7 @@
 #include <netdutils/InternetAddresses.h>
 #include <netdutils/NetworkConstants.h>  // SHA256_SIZE
 #include <netdutils/ResponseCode.h>
+#include <netdutils/Slice.h>
 #include <netdutils/SocketOption.h>
 #include <netinet/in.h>
 #include <openssl/base64.h>
@@ -89,8 +90,10 @@ using android::net::INetd;
 using android::net::ResolverStats;
 using android::net::metrics::DnsMetricsListener;
 using android::netdutils::enableSockopt;
+using android::netdutils::makeSlice;
 using android::netdutils::ResponseCode;
 using android::netdutils::ScopedAddrinfo;
+using android::netdutils::toHex;
 
 // TODO: move into libnetdutils?
 namespace {
@@ -3485,4 +3488,242 @@ TEST_F(ResolverTest, ConnectTlsServerTimeout) {
     // 3000ms is a loose upper bound. Theoretically, it takes a bit more than 1000ms.
     EXPECT_GE(3000, std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
     EXPECT_LE(1000, std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+}
+
+// Parameterized tests.
+// TODO: Merge the existing tests as parameterized test if possible.
+// TODO: Perhaps move parameterized tests to an independent file.
+enum class CallType { GETADDRINFO, GETHOSTBYNAME };
+class ResolverParameterizedTest : public ResolverTest,
+                                  public testing::WithParamInterface<CallType> {
+  protected:
+    void VerifyQueryHelloExampleComV4(const test::DNSResponder& dns, const CallType calltype) {
+        if (calltype == CallType::GETADDRINFO) {
+            const addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_DGRAM};
+            ScopedAddrinfo result = safe_getaddrinfo("hello", nullptr, &hints);
+            ASSERT_TRUE(result != nullptr);
+            EXPECT_EQ(kHelloExampleComAddrV4, ToString(result));
+        } else if (calltype == CallType::GETHOSTBYNAME) {
+            const hostent* result = gethostbyname("hello");
+            ASSERT_TRUE(result != nullptr);
+            ASSERT_EQ(4, result->h_length);
+            ASSERT_FALSE(result->h_addr_list[0] == nullptr);
+            EXPECT_EQ(kHelloExampleComAddrV4, ToString(result));
+            EXPECT_TRUE(result->h_addr_list[1] == nullptr);
+        } else {
+            FAIL() << "Unsupported call type: " << static_cast<uint32_t>(calltype);
+        }
+        EXPECT_EQ(1U, GetNumQueries(dns, kHelloExampleCom));
+    }
+};
+
+INSTANTIATE_TEST_SUITE_P(QueryCallTest, ResolverParameterizedTest,
+                         testing::Values(CallType::GETADDRINFO, CallType::GETHOSTBYNAME),
+                         [](const testing::TestParamInfo<CallType>& info) {
+                             switch (info.param) {
+                                 case CallType::GETADDRINFO:
+                                     return "GetAddrInfo";
+                                 case CallType::GETHOSTBYNAME:
+                                     return "GetHostByName";
+                                 default:
+                                     return "InvalidParameter";  // Should not happen.
+                             }
+                         });
+
+TEST_P(ResolverParameterizedTest, AuthoritySectionAndAdditionalSection) {
+    // DNS response may have more information in authority section and additional section.
+    // Currently, getanswer() of packages/modules/DnsResolver/getaddrinfo.cpp doesn't parse the
+    // content of authority section and additional section. Test these sections if they crash
+    // the resolver, just in case. See also RFC 1035 section 4.1.
+    const auto& calltype = GetParam();
+    test::DNSHeader header(kDefaultDnsHeader);
+
+    // Create a DNS response which has a authoritative nameserver record in authority
+    // section and its relevant address record in additional section.
+    //
+    // Question
+    //   hello.example.com.     IN      A
+    // Answer
+    //   hello.example.com.     IN      A   1.2.3.4
+    // Authority:
+    //   hello.example.com.     IN      NS  ns1.example.com.
+    // Additional:
+    //   ns1.example.com.       IN      A   5.6.7.8
+    //
+    // A response may have only question, answer, and authority section. Current testing response
+    // should be able to cover this condition.
+
+    // Question section.
+    test::DNSQuestion question{
+            .qname = {.name = kHelloExampleCom},
+            .qtype = ns_type::ns_t_a,
+            .qclass = ns_c_in,
+    };
+    header.questions.push_back(std::move(question));
+
+    // Answer section.
+    test::DNSRecord recordAnswer{
+            .name = {.name = kHelloExampleCom},
+            .rtype = ns_type::ns_t_a,
+            .rclass = ns_c_in,
+            .ttl = 0,  // no cache
+    };
+    EXPECT_TRUE(test::DNSResponder::fillRdata(kHelloExampleComAddrV4, recordAnswer));
+    header.answers.push_back(std::move(recordAnswer));
+
+    // Authority section.
+    test::DNSRecord recordAuthority{
+            .name = {.name = kHelloExampleCom},
+            .rtype = ns_type::ns_t_ns,
+            .rclass = ns_c_in,
+            .ttl = 0,  // no cache
+    };
+    EXPECT_TRUE(test::DNSResponder::fillRdata("ns1.example.com.", recordAuthority));
+    header.authorities.push_back(std::move(recordAuthority));
+
+    // Additional section.
+    test::DNSRecord recordAdditional{
+            .name = {.name = "ns1.example.com."},
+            .rtype = ns_type::ns_t_a,
+            .rclass = ns_c_in,
+            .ttl = 0,  // no cache
+    };
+    EXPECT_TRUE(test::DNSResponder::fillRdata("5.6.7.8", recordAdditional));
+    header.additionals.push_back(std::move(recordAdditional));
+
+    // Start DNS server.
+    test::DNSResponder dns(test::DNSResponder::MappingType::DNS_HEADER);
+    dns.addMappingDnsHeader(kHelloExampleCom, ns_type::ns_t_a, header);
+    ASSERT_TRUE(dns.startServer());
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+    dns.clearQueries();
+
+    // Expect that get the address and the resolver doesn't crash.
+    VerifyQueryHelloExampleComV4(dns, calltype);
+}
+
+TEST_P(ResolverParameterizedTest, MessageCompression) {
+    const auto& calltype = GetParam();
+
+    // The response with compressed domain name by a pointer. See RFC 1035 section 4.1.4.
+    //
+    // Ignoring the other fields of the message, the domain name of question section and answer
+    // section are presented as:
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 12 |           5           |           h           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 14 |           e           |           l           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 16 |           l           |           o           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 18 |           7           |           e           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 20 |           x           |           a           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 22 |           m           |           p           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 24 |           l           |           e           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 26 |           3           |           c           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 28 |           o           |           m           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 30 |           0           |          ...          |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    //
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 35 | 1  1|                12                       |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    const std::vector<uint8_t> kResponseAPointer = {
+            /* Header */
+            0x00, 0x00, /* Transaction ID: 0x0000 */
+            0x81, 0x80, /* Flags: qr rd ra */
+            0x00, 0x01, /* Questions: 1 */
+            0x00, 0x01, /* Answer RRs: 1 */
+            0x00, 0x00, /* Authority RRs: 0 */
+            0x00, 0x00, /* Additional RRs: 0 */
+            /* Queries */
+            0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
+            0x03, 0x63, 0x6f, 0x6d, 0x00, /* Name: hello.example.com */
+            0x00, 0x01,                   /* Type: A */
+            0x00, 0x01,                   /* Class: IN */
+            /* Answers */
+            0xc0, 0x0c,             /* Name: hello.example.com (a pointer) */
+            0x00, 0x01,             /* Type: A */
+            0x00, 0x01,             /* Class: IN */
+            0x00, 0x00, 0x00, 0x00, /* Time to live: 0 */
+            0x00, 0x04,             /* Data length: 4 */
+            0x01, 0x02, 0x03, 0x04  /* Address: 1.2.3.4 */
+    };
+
+    // The response with compressed domain name by a sequence of labels ending with a pointer. See
+    // RFC 1035 section 4.1.4.
+    //
+    // Ignoring the other fields of the message, the domain name of question section and answer
+    // section are presented as:
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 12 |           5           |           h           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 14 |           e           |           l           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 16 |           l           |           o           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 18 |           7           |           e           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 20 |           x           |           a           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 22 |           m           |           p           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 24 |           l           |           e           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 26 |           3           |           c           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 28 |           o           |           m           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 30 |           0           |          ...          |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    //
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 35 |           5           |           h           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 37 |           e           |           l           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 39 |           l           |           o           |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    // 41 | 1  1|                18                       |
+    //    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    const std::vector<uint8_t> kResponseLabelEndingWithAPointer = {
+            /* Header */
+            0x00, 0x00, /* Transaction ID: 0x0000 */
+            0x81, 0x80, /* Flags: qr rd ra */
+            0x00, 0x01, /* Questions: 1 */
+            0x00, 0x01, /* Answer RRs: 1 */
+            0x00, 0x00, /* Authority RRs: 0 */
+            0x00, 0x00, /* Additional RRs: 0 */
+            /* Queries */
+            0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
+            0x03, 0x63, 0x6f, 0x6d, 0x00, /* Name: hello.example.com */
+            0x00, 0x01,                   /* Type: A */
+            0x00, 0x01,                   /* Class: IN */
+            /* Answers */
+            0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0xc0,
+            0x12,                   /* Name: hello.example.com (a label ending with a pointer) */
+            0x00, 0x01,             /* Type: A */
+            0x00, 0x01,             /* Class: IN */
+            0x00, 0x00, 0x00, 0x00, /* Time to live: 0 */
+            0x00, 0x04,             /* Data length: 4 */
+            0x01, 0x02, 0x03, 0x04  /* Address: 1.2.3.4 */
+    };
+
+    for (const auto& response : {kResponseAPointer, kResponseLabelEndingWithAPointer}) {
+        SCOPED_TRACE(StringPrintf("Hex dump: %s", toHex(makeSlice(response)).c_str()));
+
+        test::DNSResponder dns(test::DNSResponder::MappingType::BINARY_PACKET);
+        dns.addMappingBinaryPacket(kHelloExampleComQueryV4, response);
+        StartDns(dns, {});
+        ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+
+        // Expect no cache because the TTL of testing responses are 0.
+        VerifyQueryHelloExampleComV4(dns, calltype);
+    }
 }
