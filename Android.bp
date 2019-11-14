@@ -71,7 +71,7 @@ cc_library {
     // Link most things statically to minimize our dependence on system ABIs.
     stl: "libc++_static",
     static_libs: [
-        "dnsresolver_aidl_interface-unstable-ndk_platform",
+        "dnsresolver_aidl_interface-ndk_platform",
         "libbase",
         "libcutils",
         "libjsoncpp",
@@ -176,7 +176,7 @@ cc_test {
         "libutils",
     ],
     static_libs: [
-        "dnsresolver_aidl_interface-unstable-cpp",
+        "dnsresolver_aidl_interface-cpp",
         "libbase",
         "libgmock",
         "libnetd_test_dnsresponder",
