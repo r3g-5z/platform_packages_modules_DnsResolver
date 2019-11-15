@@ -2,7 +2,7 @@ cc_library_static {
     name: "libnetd_test_dnsresponder",
     defaults: ["netd_defaults"],
     shared_libs: [
-        "dnsresolver_aidl_interface-unstable-cpp",
+        "dnsresolver_aidl_interface-cpp",
         "libbase",
         "libbinder",
         "libnetd_client",
