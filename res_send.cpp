@@ -103,11 +103,11 @@
 #include "DnsTlsTransport.h"
 #include "PrivateDnsConfiguration.h"
 #include "netd_resolv/resolv.h"
-#include "netd_resolv/stats.h"
 #include "private/android_filesystem_config.h"
 #include "res_debug.h"
 #include "res_init.h"
 #include "resolv_cache.h"
+#include "stats.h"
 #include "stats.pb.h"
 #include "util.h"
 
@@ -1085,8 +1085,9 @@ PrivateDnsModes convertEnumType(PrivateDnsMode privateDnsmode) {
             return PrivateDnsModes::PDM_OPPORTUNISTIC;
         case PrivateDnsMode::STRICT:
             return PrivateDnsModes::PDM_STRICT;
+        default:
+            return PrivateDnsModes::PDM_UNKNOWN;
     }
-    return PrivateDnsModes::PDM_UNKNOWN;
 }
 
 static int res_tls_send(res_state statp, const Slice query, const Slice answer, int* rcode,

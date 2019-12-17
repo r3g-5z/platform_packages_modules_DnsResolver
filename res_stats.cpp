@@ -21,8 +21,7 @@
 
 #include <android-base/logging.h>
 
-#include "netd_resolv/stats.h"
-
+#include "stats.h"
 
 // Calculate the round-trip-time from start time t0 and end time t1.
 int _res_stats_calculate_rtt(const timespec* t1, const timespec* t0) {
@@ -119,11 +118,11 @@ static bool res_stats_usable_server(const res_params* params, res_stats* stats) 
     android_net_res_stats_aggregate(stats, &successes, &errors, &timeouts, &internal_errors,
                                     &rtt_avg, &last_sample_time);
     if (successes >= 0 && errors >= 0 && timeouts >= 0) {
-        int total = successes + errors + timeouts;
+        int total = successes + errors + timeouts + internal_errors;
         LOG(INFO) << __func__ << ": NS stats: S " << successes << " + E " << errors << " + T "
                   << timeouts << " + I " << internal_errors << " = " << total
                   << ", rtt = " << rtt_avg << ", min_samples = " << unsigned(params->min_samples);
-        if (total >= params->min_samples && (errors > 0 || timeouts > 0)) {
+        if (total >= params->min_samples) {
             int success_rate = successes * 100 / total;
             LOG(INFO) << __func__ << ": success rate " << success_rate;
             if (success_rate < params->success_threshold) {

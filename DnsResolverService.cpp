@@ -92,7 +92,7 @@ binder_status_t DnsResolverService::start() {
     return STATUS_OK;
 }
 
-binder_status_t DnsResolverService::dump(int fd, const char**, uint32_t) {
+binder_status_t DnsResolverService::dump(int fd, const char** args, uint32_t numArgs) {
     auto dump_permission = checkAnyPermission({PERM_DUMP});
     if (!dump_permission.isOk()) {
         return STATUS_PERMISSION_DENIED;
@@ -101,6 +101,14 @@ binder_status_t DnsResolverService::dump(int fd, const char**, uint32_t) {
     // This method does not grab any locks. If individual classes need locking
     // their dump() methods MUST handle locking appropriately.
     DumpWriter dw(fd);
+
+    if (numArgs == 1 && std::string(args[0]) == DnsQueryLog::DUMP_KEYWORD) {
+        dw.blankline();
+        gDnsResolv->dnsQueryLog().dump(dw);
+        dw.blankline();
+        return STATUS_OK;
+    }
+
     for (auto netId : resolv_list_caches()) {
         dw.println("NetId: %u", netId);
         gDnsResolv->resolverCtrl.dump(dw, netId);
@@ -166,6 +174,13 @@ binder_status_t DnsResolverService::dump(int fd, const char**, uint32_t) {
         const ResolverParamsParcel& resolverParams) {
     // Locking happens in PrivateDnsConfiguration and res_* functions.
     ENFORCE_INTERNAL_PERMISSIONS();
+
+    uid_t uid = AIBinder_getCallingUid();
+    if (resolverParams.caCertificate.size() != 0 && uid == AID_SYSTEM) {
+        auto err = StringPrintf("UID %d is not authorized to set a non-empty CA certificate", uid);
+        return ::ndk::ScopedAStatus(AStatus_fromExceptionCodeWithMessage(EX_SECURITY, err.c_str()));
+    }
+
     // TODO: Remove this log after AIDL gen_log supporting more types, b/129732660
     auto entry =
             gDnsResolverLog.newEntry()
@@ -245,6 +260,15 @@ binder_status_t DnsResolverService::dump(int fd, const char**, uint32_t) {
     ENFORCE_NETWORK_STACK_PERMISSIONS();
 
     int res = gDnsResolv->resolverCtrl.createNetworkCache(netId);
+
+    return statusFromErrcode(res);
+}
+
+::ndk::ScopedAStatus DnsResolverService::flushNetworkCache(int netId) {
+    // Locking happens in res_cache.cpp functions.
+    ENFORCE_NETWORK_STACK_PERMISSIONS();
+
+    int res = gDnsResolv->resolverCtrl.flushNetworkCache(netId);
 
     return statusFromErrcode(res);
 }
