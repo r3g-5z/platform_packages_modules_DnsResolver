@@ -74,8 +74,10 @@
 
 #include "hostent.h"
 #include "netd_resolv/resolv.h"
+#include "res_comp.h"
+#include "res_debug.h"  // p_class(), p_type()
+#include "res_init.h"
 #include "resolv_cache.h"
-#include "resolv_private.h"
 #include "stats.pb.h"
 
 using android::net::NetworkDnsEventReported;
@@ -89,12 +91,6 @@ using android::net::NetworkDnsEventReported;
 // buffer.
 #define ALIGNBYTES (sizeof(uintptr_t) - 1)
 #define ALIGN(p) (((uintptr_t)(p) + ALIGNBYTES) & ~ALIGNBYTES)
-
-#define maybe_ok(res, nm, ok) ((ok)(nm) != 0)
-#define maybe_hnok(res, hn) maybe_ok((res), (hn), res_hnok)
-#define maybe_dnok(res, dn) maybe_ok((res), (dn), res_dnok)
-
-#define MAXPACKET (8 * 1024)
 
 constexpr int MAXADDRS = 35;
 
@@ -116,7 +112,7 @@ static void pad_v4v6_hostent(struct hostent* hp, char** bpp, char* ep);
 static int dns_gethtbyaddr(const unsigned char* uaddr, int len, int af,
                            const android_net_context* netcontext, getnamaddr* info,
                            NetworkDnsEventReported* event);
-static int dns_gethtbyname(const char* name, int af, getnamaddr* info);
+static int dns_gethtbyname(ResState* res, const char* name, int af, getnamaddr* info);
 
 #define BOUNDED_INCR(x)      \
     do {                     \
@@ -143,7 +139,6 @@ static struct hostent* getanswer(const querybuf* answer, int anslen, const char*
     char tbuf[MAXDNAME];
     char* addr_ptrs[MAXADDRS];
     const char* tname;
-    int (*name_ok)(const char*);
     std::vector<char*> aliases;
 
     _DIAGASSERT(answer != NULL);
@@ -152,6 +147,8 @@ static struct hostent* getanswer(const querybuf* answer, int anslen, const char*
     tname = qname;
     hent->h_name = NULL;
     eom = answer->buf + anslen;
+
+    bool (*name_ok)(const char* dn);
     switch (qtype) {
         case T_A:
         case T_AAAA:
@@ -178,7 +175,7 @@ static struct hostent* getanswer(const querybuf* answer, int anslen, const char*
     if (qdcount != 1) goto no_recovery;
 
     n = dn_expand(answer->buf, eom, cp, bp, (int) (ep - bp));
-    if ((n < 0) || !maybe_ok(res, bp, name_ok)) goto no_recovery;
+    if ((n < 0) || !name_ok(bp)) goto no_recovery;
 
     BOUNDED_INCR(n + QFIXEDSZ);
     if (qtype == T_A || qtype == T_AAAA) {
@@ -199,7 +196,7 @@ static struct hostent* getanswer(const querybuf* answer, int anslen, const char*
     had_error = 0;
     while (ancount-- > 0 && cp < eom && !had_error) {
         n = dn_expand(answer->buf, eom, cp, bp, (int) (ep - bp));
-        if ((n < 0) || !maybe_ok(res, bp, name_ok)) {
+        if ((n < 0) || !name_ok(bp)) {
             had_error++;
             continue;
         }
@@ -220,7 +217,7 @@ static struct hostent* getanswer(const querybuf* answer, int anslen, const char*
         }
         if ((qtype == T_A || qtype == T_AAAA) && type == T_CNAME) {
             n = dn_expand(answer->buf, eom, cp, tbuf, (int) sizeof tbuf);
-            if ((n < 0) || !maybe_ok(res, tbuf, name_ok)) {
+            if ((n < 0) || !name_ok(tbuf)) {
                 had_error++;
                 continue;
             }
@@ -247,7 +244,7 @@ static struct hostent* getanswer(const querybuf* answer, int anslen, const char*
         }
         if (qtype == T_PTR && type == T_CNAME) {
             n = dn_expand(answer->buf, eom, cp, tbuf, (int) sizeof tbuf);
-            if (n < 0 || !maybe_dnok(res, tbuf)) {
+            if (n < 0 || !res_dnok(tbuf)) {
                 had_error++;
                 continue;
             }
@@ -280,7 +277,7 @@ static struct hostent* getanswer(const querybuf* answer, int anslen, const char*
                     continue; /* XXX - had_error++ ? */
                 }
                 n = dn_expand(answer->buf, eom, cp, bp, (int) (ep - bp));
-                if ((n < 0) || !maybe_hnok(res, bp)) {
+                if ((n < 0) || !res_hnok(bp)) {
                     had_error++;
                     break;
                 }
@@ -393,9 +390,8 @@ int resolv_gethostbyname(const char* name, int af, hostent* hp, char* buf, size_
                          NetworkDnsEventReported* event) {
     getnamaddr info;
 
-    res_state res = res_get_state();
-    if (res == nullptr) return EAI_MEMORY;
-    res_setnetcontext(res, netcontext, event);
+    ResState res;
+    res_init(&res, netcontext, event);
 
     size_t size;
     switch (af) {
@@ -450,7 +446,7 @@ int resolv_gethostbyname(const char* name, int af, hostent* hp, char* buf, size_
     info.buf = buf;
     info.buflen = buflen;
     if (_hf_gethtbyname2(name, af, &info)) {
-        int error = dns_gethtbyname(name, af, &info);
+        int error = dns_gethtbyname(&res, name, af, &info);
         if (error != 0) return error;
     }
     *result = hp;
@@ -652,7 +648,7 @@ static void pad_v4v6_hostent(struct hostent* hp, char** bpp, char* ep) {
                          });
 }
 
-static int dns_gethtbyname(const char* name, int addr_type, getnamaddr* info) {
+static int dns_gethtbyname(ResState* res, const char* name, int addr_type, getnamaddr* info) {
     int n, type;
     info->hp->h_addrtype = addr_type;
 
@@ -669,9 +665,6 @@ static int dns_gethtbyname(const char* name, int addr_type, getnamaddr* info) {
             return EAI_FAMILY;
     }
     auto buf = std::make_unique<querybuf>();
-
-    res_state res = res_get_state();
-    if (!res) return EAI_MEMORY;
 
     int he;
     n = res_nsearch(res, name, C_IN, type, buf->buf, (int)sizeof(buf->buf), &he);
@@ -734,12 +727,10 @@ static int dns_gethtbyaddr(const unsigned char* uaddr, int len, int af,
 
     auto buf = std::make_unique<querybuf>();
 
-    res_state res = res_get_state();
-    if (!res) return EAI_MEMORY;
-
-    res_setnetcontext(res, netcontext, event);
+    ResState res;
+    res_init(&res, netcontext, event);
     int he;
-    n = res_nquery(res, qbuf, C_IN, T_PTR, buf->buf, (int)sizeof(buf->buf), &he);
+    n = res_nquery(&res, qbuf, C_IN, T_PTR, buf->buf, (int)sizeof(buf->buf), &he);
     if (n < 0) {
         LOG(DEBUG) << __func__ << ": res_nquery failed (" << n << ")";
         // Note that res_nquery() doesn't set the pair NETDB_INTERNAL and errno.

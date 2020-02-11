@@ -24,6 +24,7 @@
 #include <net/if.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <resolv.h>  // b64_pton()
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -54,10 +55,10 @@
 #include "ResolverEventReporter.h"
 #include "getaddrinfo.h"
 #include "gethnamaddr.h"
-#include "netd_resolv/stats.h"  // RCODE_TIMEOUT
 #include "res_send.h"
 #include "resolv_cache.h"
 #include "resolv_private.h"
+#include "stats.h"  // RCODE_TIMEOUT
 #include "stats.pb.h"
 
 using aidl::android::net::metrics::INetdEventListener;
@@ -73,10 +74,6 @@ namespace {
 
 // Limits the number of outstanding DNS queries by client UID.
 constexpr int MAX_QUERIES_PER_UID = 256;
-
-// Max packet size for answer, sync with getaddrinfo.c
-// TODO: switch to dynamically allocated buffers with std::vector
-constexpr int MAXPACKET = 8 * 1024;
 
 android::netdutils::OperationLimiter<uid_t> queryLimiter(MAX_QUERIES_PER_UID);
 
@@ -147,7 +144,7 @@ bool hasPermissionToBypassPrivateDns(uid_t uid) {
     return false;
 }
 
-void maybeFixupNetContext(android_net_context* ctx) {
+void maybeFixupNetContext(android_net_context* ctx, pid_t pid) {
     if (requestingUseLocalNameservers(ctx->flags) && !hasPermissionToBypassPrivateDns(ctx->uid)) {
         // Not permitted; clear the flag.
         ctx->flags &= ~NET_CONTEXT_FLAG_USE_LOCAL_NAMESERVERS;
@@ -161,6 +158,7 @@ void maybeFixupNetContext(android_net_context* ctx) {
             ctx->flags |= NET_CONTEXT_FLAG_USE_DNS_OVER_TLS | NET_CONTEXT_FLAG_USE_EDNS;
         }
     }
+    ctx->pid = pid;
 }
 
 void addIpAddrWithinLimit(std::vector<std::string>* ip_addrs, const sockaddr* addr,
@@ -293,7 +291,23 @@ bool parseQuery(const uint8_t* msg, size_t msgLen, uint16_t* query_id, int* rr_t
     return true;
 }
 
-void initDnsEvent(NetworkDnsEventReported* event) {
+// Note: Even if it returns PDM_OFF, it doesn't mean there's no DoT stats in the message
+// because Private DNS mode can change at any time.
+PrivateDnsModes getPrivateDnsModeForMetrics(uint32_t netId) {
+    switch (gPrivateDnsConfiguration.getStatus(netId).mode) {
+        case PrivateDnsMode::OFF:
+            // It can also be due to netId not found.
+            return PrivateDnsModes::PDM_OFF;
+        case PrivateDnsMode::OPPORTUNISTIC:
+            return PrivateDnsModes::PDM_OPPORTUNISTIC;
+        case PrivateDnsMode::STRICT:
+            return PrivateDnsModes::PDM_STRICT;
+        default:
+            return PrivateDnsModes::PDM_UNKNOWN;
+    }
+}
+
+void initDnsEvent(NetworkDnsEventReported* event, const android_net_context& netContext) {
     // The value 0 has the special meaning of unset/unknown in Westworld atoms. So, we set both
     // flags to -1 as default value.
     //  1. The hints flag is only used in resolv_getaddrinfo. When user set it to -1 in
@@ -304,6 +318,7 @@ void initDnsEvent(NetworkDnsEventReported* event) {
     //     resolv_res_nsend,res_nsend will do nothing special by the setting.
     event->set_hints_ai_flags(-1);
     event->set_res_nsend_flags(-1);
+    event->set_private_dns_modes(getPrivateDnsModeForMetrics(netContext.dns_netid));
 }
 
 // Return 0 if the event should not be logged.
@@ -313,6 +328,24 @@ uint32_t getDnsEventSubsamplingRate(int netid, int returnCode) {
     if (subsampling_denom == 0) return 0;
     // Sample the event with a chance of 1 / denom.
     return (arc4random_uniform(subsampling_denom) == 0) ? subsampling_denom : 0;
+}
+
+void maybeLogQuery(int eventType, const android_net_context& netContext,
+                   const NetworkDnsEventReported& event, const std::string& query_name,
+                   const std::vector<std::string>& ip_addrs) {
+    // Skip reverse queries.
+    if (eventType == INetdEventListener::EVENT_GETHOSTBYADDR) return;
+
+    for (const auto& query : event.dns_query_events().dns_query_event()) {
+        // Log it when the cache misses.
+        if (query.cache_hit() != CS_FOUND) {
+            const int timeTakenMs = event.latency_micros() / 1000;
+            DnsQueryLog::Record record(netContext.dns_netid, netContext.uid, netContext.pid,
+                                       query_name, ip_addrs, timeTakenMs);
+            gDnsResolv->dnsQueryLog().push(std::move(record));
+            return;
+        }
+    }
 }
 
 void reportDnsEvent(int eventType, const android_net_context& netContext, int latencyUs,
@@ -328,6 +361,8 @@ void reportDnsEvent(int eventType, const android_net_context& netContext, int la
                                          event.res_nsend_flags(), event.network_type(),
                                          event.private_dns_modes(), dnsQueryBytesField, rate);
     }
+
+    maybeLogQuery(eventType, netContext, event, query_name, ip_addrs);
 
     const auto& listeners = ResolverEventReporter::getInstance().getListeners();
     if (listeners.size() == 0) {
@@ -538,6 +573,13 @@ DnsProxyListener::GetAddrInfoHandler::~GetAddrInfoHandler() {
     free(mHints);
 }
 
+static bool evaluate_domain_name(const android_net_context &netcontext,
+                                 const char *host) {
+    if (!gResNetdCallbacks.evaluate_domain_name)
+        return true;
+    return gResNetdCallbacks.evaluate_domain_name(netcontext, host);
+}
+
 static bool sendBE32(SocketClient* c, uint32_t data) {
     uint32_t be_data = htonl(data);
     return c->sendData(&be_data, sizeof(be_data)) == 0;
@@ -669,13 +711,18 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
 
     addrinfo* result = nullptr;
     Stopwatch s;
-    maybeFixupNetContext(&mNetContext);
+    maybeFixupNetContext(&mNetContext, mClient->getPid());
     const uid_t uid = mClient->getUid();
     int32_t rv = 0;
     NetworkDnsEventReported event;
-    initDnsEvent(&event);
+    initDnsEvent(&event, mNetContext);
     if (queryLimiter.start(uid)) {
-        rv = resolv_getaddrinfo(mHost, mService, mHints, &mNetContext, &result, &event);
+        if (evaluate_domain_name(mNetContext, mHost)) {
+            rv = resolv_getaddrinfo(mHost, mService, mHints, &mNetContext, &result,
+                                    &event);
+        } else {
+            rv = EAI_SYSTEM;
+        }
         queryLimiter.finish(uid);
     } else {
         // Note that this error code is currently not passed down to the client.
@@ -856,7 +903,7 @@ void DnsProxyListener::ResNSendHandler::run() {
                << mNetContext.dns_mark << " " << mNetContext.uid << " " << mNetContext.flags << "}";
 
     Stopwatch s;
-    maybeFixupNetContext(&mNetContext);
+    maybeFixupNetContext(&mNetContext, mClient->getPid());
 
     // Decode
     std::vector<uint8_t> msg(MAXPACKET, 0);
@@ -885,12 +932,17 @@ void DnsProxyListener::ResNSendHandler::run() {
 
     // Send DNS query
     std::vector<uint8_t> ansBuf(MAXPACKET, 0);
-    int arcode, nsendAns = -1;
+    int rcode = ns_r_noerror;
+    int nsendAns = -1;
     NetworkDnsEventReported event;
-    initDnsEvent(&event);
+    initDnsEvent(&event, mNetContext);
     if (queryLimiter.start(uid)) {
-        nsendAns = resolv_res_nsend(&mNetContext, msg.data(), msgLen, ansBuf.data(), MAXPACKET,
-                                    &arcode, static_cast<ResNsendFlags>(mFlags), &event);
+        if (evaluate_domain_name(mNetContext, rr_name.c_str())) {
+            nsendAns = resolv_res_nsend(&mNetContext, msg.data(), msgLen, ansBuf.data(), MAXPACKET,
+                                        &rcode, static_cast<ResNsendFlags>(mFlags), &event);
+        } else {
+            nsendAns = -EAI_SYSTEM;
+        }
         queryLimiter.finish(uid);
     } else {
         LOG(WARNING) << "ResNSendHandler::run: resnsend: from UID " << uid
@@ -908,13 +960,13 @@ void DnsProxyListener::ResNSendHandler::run() {
         sendBE32(mClient, nsendAns);
         if (rr_type == ns_t_a || rr_type == ns_t_aaaa) {
             reportDnsEvent(INetdEventListener::EVENT_RES_NSEND, mNetContext, latencyUs,
-                           resNSendToAiError(nsendAns, arcode), event, rr_name);
+                           resNSendToAiError(nsendAns, rcode), event, rr_name);
         }
         return;
     }
 
     // Send rcode
-    if (!sendBE32(mClient, arcode)) {
+    if (!sendBE32(mClient, rcode)) {
         PLOG(WARNING) << "ResNSendHandler::run: resnsend: failed to send rcode to uid " << uid;
         return;
     }
@@ -931,7 +983,7 @@ void DnsProxyListener::ResNSendHandler::run() {
         const int total_ip_addr_count =
                 extractResNsendAnswers((uint8_t*) ansBuf.data(), nsendAns, rr_type, &ip_addrs);
         reportDnsEvent(INetdEventListener::EVENT_RES_NSEND, mNetContext, latencyUs,
-                       resNSendToAiError(nsendAns, arcode), event, rr_name, ip_addrs,
+                       resNSendToAiError(nsendAns, rcode), event, rr_name, ip_addrs,
                        total_ip_addr_count);
     }
 }
@@ -1073,17 +1125,21 @@ void DnsProxyListener::GetHostByNameHandler::doDns64Synthesis(int32_t* rv, hoste
 
 void DnsProxyListener::GetHostByNameHandler::run() {
     Stopwatch s;
-    maybeFixupNetContext(&mNetContext);
+    maybeFixupNetContext(&mNetContext, mClient->getPid());
     const uid_t uid = mClient->getUid();
     hostent* hp = nullptr;
     hostent hbuf;
     char tmpbuf[MAXPACKET];
     int32_t rv = 0;
     NetworkDnsEventReported event;
-    initDnsEvent(&event);
+    initDnsEvent(&event, mNetContext);
     if (queryLimiter.start(uid)) {
-        rv = resolv_gethostbyname(mName, mAf, &hbuf, tmpbuf, sizeof tmpbuf, &mNetContext, &hp,
-                                  &event);
+        if (evaluate_domain_name(mNetContext, mName)) {
+            rv = resolv_gethostbyname(mName, mAf, &hbuf, tmpbuf, sizeof tmpbuf, &mNetContext, &hp,
+                                      &event);
+        } else {
+            rv = EAI_SYSTEM;
+        }
         queryLimiter.finish(uid);
     } else {
         rv = EAI_MEMORY;
@@ -1236,14 +1292,14 @@ void DnsProxyListener::GetHostByAddrHandler::doDns64ReverseLookup(hostent* hbuf,
 
 void DnsProxyListener::GetHostByAddrHandler::run() {
     Stopwatch s;
-    maybeFixupNetContext(&mNetContext);
+    maybeFixupNetContext(&mNetContext, mClient->getPid());
     const uid_t uid = mClient->getUid();
     hostent* hp = nullptr;
     hostent hbuf;
     char tmpbuf[MAXPACKET];
     int32_t rv = 0;
     NetworkDnsEventReported event;
-    initDnsEvent(&event);
+    initDnsEvent(&event, mNetContext);
     if (queryLimiter.start(uid)) {
         rv = resolv_gethostbyaddr(mAddress, mAddressLen, mAddressFamily, &hbuf, tmpbuf,
                                   sizeof tmpbuf, &mNetContext, &hp, &event);

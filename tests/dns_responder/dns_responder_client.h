@@ -25,6 +25,7 @@
 #include "android/net/IDnsResolver.h"
 #include "android/net/INetd.h"
 #include "dns_responder.h"
+#include "dns_tls_certificate.h"
 
 inline const std::vector<std::string> kDefaultServers = {"127.0.0.3"};
 inline const std::vector<std::string> kDefaultSearchDomains = {"example.com"};
@@ -36,6 +37,8 @@ inline const std::vector<int> kDefaultParams = {
         2,        // retry count
 };
 
+// TODO: Replace binder service related code to ndk version after finishing all tests migration
+// from libbinder to libbinder_ndk.
 class DnsResponderClient {
   public:
     struct Mapping {
@@ -50,14 +53,12 @@ class DnsResponderClient {
     static void SetupMappings(unsigned num_hosts, const std::vector<std::string>& domains,
                               std::vector<Mapping>* mappings);
 
+    // This function is deprecated. Please use SetResolversFromParcel() instead.
     bool SetResolversForNetwork(const std::vector<std::string>& servers = kDefaultServers,
                                 const std::vector<std::string>& domains = kDefaultSearchDomains,
                                 const std::vector<int>& params = kDefaultParams);
 
-    bool SetResolversForNetwork(const std::vector<std::string>& servers,
-                                const std::vector<std::string>& searchDomains,
-                                const std::string& params);
-
+    // This function is deprecated. Please use SetResolversFromParcel() instead.
     bool SetResolversWithTls(const std::vector<std::string>& servers,
                              const std::vector<std::string>& searchDomains,
                              const std::vector<int>& params, const std::string& name) {
@@ -66,12 +67,18 @@ class DnsResponderClient {
         return SetResolversWithTls(servers, searchDomains, params, servers, name);
     }
 
+    // This function is deprecated. Please use SetResolversFromParcel() instead.
     bool SetResolversWithTls(const std::vector<std::string>& servers,
                              const std::vector<std::string>& searchDomains,
                              const std::vector<int>& params,
                              const std::vector<std::string>& tlsServers, const std::string& name);
 
-    static void SetupDNSServers(unsigned num_servers, const std::vector<Mapping>& mappings,
+    bool SetResolversFromParcel(const android::net::ResolverParamsParcel& resolverParams);
+
+    // Return a default resolver configuration for opportunistic mode.
+    static android::net::ResolverParamsParcel GetDefaultResolverParamsParcel();
+
+    static void SetupDNSServers(unsigned numServers, const std::vector<Mapping>& mappings,
                                 std::vector<std::unique_ptr<test::DNSResponder>>* dns,
                                 std::vector<std::string>* servers);
 

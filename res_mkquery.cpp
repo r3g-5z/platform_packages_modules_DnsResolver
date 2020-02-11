@@ -80,8 +80,11 @@
 #include <string.h>
 
 #include <android-base/logging.h>
+#include <netd_resolv/resolv.h>  // NET_CONTEXT_FLAG_USE_DNS_OVER_TLS
 
-#include "resolv_private.h"
+#include "res_comp.h"
+#include "res_debug.h"
+#include "resolv_private.h"  // res_state
 
 // Queries will be padded to a multiple of this length when EDNS0 is active.
 constexpr uint16_t kEdns0Padding = 128;
@@ -93,19 +96,15 @@ extern const char* const _res_opcodes[] = {
         "11",     "12",     "13",      "ZONEINIT", "ZONEREF",
 };
 
-/*
- * Form all types of queries.
- * Returns the size of the result or -1.
- */
-int res_nmkquery(res_state statp, int op,     /* opcode of query */
-                 const char* dname,           /* domain name */
-                 int cl, int type,            /* class and type of query */
-                 const uint8_t* data,         /* resource record data */
-                 int datalen,                 /* length of data */
-                 const uint8_t* /*newrr_in*/, /* new rr for modify or append */
-                 uint8_t* buf,                /* buffer to put query */
-                 int buflen)                  /* size of buffer */
-{
+// Form all types of queries. Returns the size of the result or -1.
+int res_nmkquery(int op,               // opcode of query
+                 const char* dname,    // domain name
+                 int cl, int type,     // class and type of query
+                 const uint8_t* data,  // resource record data
+                 int datalen,          // length of data
+                 uint8_t* buf,         // buffer to put query
+                 int buflen,           // size of buffer
+                 int netcontext_flags) {
     HEADER* hp;
     uint8_t *cp, *ep;
     int n;
@@ -123,7 +122,7 @@ int res_nmkquery(res_state statp, int op,     /* opcode of query */
     hp->id = htons(arc4random_uniform(65536));
     hp->opcode = op;
     hp->rd = true;
-    hp->ad = (statp->netcontext_flags & NET_CONTEXT_FLAG_USE_DNS_OVER_TLS) != 0U;
+    hp->ad = (netcontext_flags & NET_CONTEXT_FLAG_USE_DNS_OVER_TLS) != 0U;
     hp->rcode = NOERROR;
     cp = buf + HFIXEDSZ;
     ep = buf + buflen;

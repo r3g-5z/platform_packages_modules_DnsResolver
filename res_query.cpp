@@ -89,12 +89,6 @@
 #include "resolv_cache.h"
 #include "resolv_private.h"
 
-#if PACKETSZ > 1024
-#define MAXPACKET PACKETSZ
-#else
-#define MAXPACKET 1024
-#endif
-
 /*
  * Formulate a normal query, send, and await answer.
  * Returned answer is placed in supplied buffer "answer".
@@ -123,7 +117,8 @@ again:
 
     LOG(DEBUG) << __func__ << ": (" << cl << ", " << type << ")";
 
-    n = res_nmkquery(statp, QUERY, name, cl, type, NULL, 0, NULL, buf, sizeof(buf));
+    n = res_nmkquery(QUERY, name, cl, type, /*data=*/nullptr, 0, buf, sizeof(buf),
+                     statp->netcontext_flags);
     if (n > 0 &&
         (statp->netcontext_flags &
          (NET_CONTEXT_FLAG_USE_DNS_OVER_TLS | NET_CONTEXT_FLAG_USE_EDNS)) &&
@@ -255,7 +250,7 @@ int res_nsearch(res_state statp, const char* name, /* domain name */
          * be loaded once for the thread instead of each
          * time a query is tried.
          */
-        _resolv_populate_res_for_net(statp);
+        resolv_populate_res_for_net(statp);
 
         for (const auto& domain : statp->search_domains) {
             if (domain == "." || domain == "") ++root_on_list;

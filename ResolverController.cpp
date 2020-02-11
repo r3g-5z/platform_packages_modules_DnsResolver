@@ -34,8 +34,8 @@
 #include "PrivateDnsConfiguration.h"
 #include "ResolverEventReporter.h"
 #include "ResolverStats.h"
-#include "netd_resolv/stats.h"
 #include "resolv_cache.h"
+#include "stats.h"
 
 using aidl::android::net::ResolverParamsParcel;
 
@@ -194,6 +194,11 @@ int ResolverController::createNetworkCache(unsigned netId) {
     return resolv_create_cache_for_net(netId);
 }
 
+int ResolverController::flushNetworkCache(unsigned netId) {
+    LOG(VERBOSE) << __func__ << ": netId = " << netId;
+    return resolv_flush_cache_for_net(netId);
+}
+
 int ResolverController::setResolverConfiguration(const ResolverParamsParcel& resolverParams) {
     using aidl::android::net::IDnsResolver;
 
@@ -210,9 +215,9 @@ int ResolverController::setResolverConfiguration(const ResolverParamsParcel& res
     if (tlsServers.size() > MAXNS) {
         tlsServers.resize(MAXNS);
     }
-    const int err = gPrivateDnsConfiguration.set(
-            resolverParams.netId, fwmark.intValue, tlsServers, resolverParams.tlsName,
-            resolverParams.caCertificate, resolverParams.tlsConnectTimeoutMs);
+    const int err =
+            gPrivateDnsConfiguration.set(resolverParams.netId, fwmark.intValue, tlsServers,
+                                         resolverParams.tlsName, resolverParams.caCertificate);
 
     if (err != 0) {
         return err;
@@ -227,7 +232,8 @@ int ResolverController::setResolverConfiguration(const ResolverParamsParcel& res
     res_params.retry_count = resolverParams.retryCount;
 
     return resolv_set_nameservers(resolverParams.netId, resolverParams.servers,
-                                  resolverParams.domains, res_params);
+                                  resolverParams.domains, res_params,
+                                  resolverParams.experimentalOptions);
 }
 
 int ResolverController::getResolverInfo(int32_t netId, std::vector<std::string>* servers,
@@ -356,6 +362,8 @@ void ResolverController::dump(DumpWriter& dw, unsigned netId) {
             dw.decIndent();
         }
         dw.println("Concurrent DNS query timeout: %d", wait_for_pending_req_timeout_count[0]);
+        resolv_stats_dump(dw, netId);
+        resolv_oem_options_dump(dw, netId);
     }
     dw.decIndent();
 }

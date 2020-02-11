@@ -38,6 +38,7 @@
 #include <netdutils/SocketOption.h>
 #include <netdutils/ThreadUtil.h>
 
+#include "netd_resolv/resolv.h"
 #include "private/android_filesystem_config.h"  // AID_DNS
 #include "resolv_private.h"
 
@@ -95,7 +96,7 @@ Status DnsTlsSocket::tcpConnect() {
         return Status(errno);
     }
 
-    resolv_tag_socket(mSslFd.get(), AID_DNS);
+    resolv_tag_socket(mSslFd.get(), AID_DNS, NET_CONTEXT_INVALID_PID);
 
     const socklen_t len = sizeof(mMark);
     if (setsockopt(mSslFd.get(), SOL_SOCKET, SO_MARK, &mMark, len) == -1) {
@@ -159,7 +160,9 @@ bool DnsTlsSocket::initialize() {
     // For discussion of alternative, sustainable approaches see b/71909242.
     if (RESOLV_INJECT_CA_CERTIFICATE && !mServer.certificate.empty()) {
         // Inject test CA certs from ResolverParamsParcel.caCertificate for internal testing.
-        LOG(WARNING) << "test CA certificate is valid";
+        // This is only allowed by DnsResolverService if the caller is not AID_SYSTEM, and on
+        // debug builds.
+        LOG(WARNING) << "Setting test CA certificate. This should never happen in production code.";
         if (!setTestCaCertificate()) {
             LOG(ERROR) << "Failed to set test CA certificate";
             return false;

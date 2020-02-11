@@ -3,11 +3,8 @@ cc_library_headers {
     export_include_dirs: ["include"],
 }
 
-//For the test to use
-//TODO: 1. Need to Refactor ResolverStats related code(ex: ResolverController::getDnsInfo).
-//         Then removing this library header file.
-//      2. Change the imports path in netd/TEST_MAPPING after migrating from
-//         system/netd/resolv to packages/modules/resolv.
+// Used only by dns_responder_client_ndk.cpp for ResolverStats.h
+// TODO: refactor stats to use a Parcel and eliminate this dependency
 cc_library_headers {
     name: "libnetd_resolv_internal_headers",
     export_include_dirs: ["."],
@@ -18,6 +15,8 @@ aidl_interface {
     local_include_dir: "binder",
     srcs: [
         "binder/android/net/IDnsResolver.aidl",
+        "binder/android/net/ResolverHostsParcel.aidl",
+        "binder/android/net/ResolverExperimentalOptionsParcel.aidl",
         "binder/android/net/ResolverParamsParcel.aidl",
     ],
     imports: [
@@ -28,16 +27,22 @@ aidl_interface {
             gen_log: true,
         },
     },
-    api_dir: "aidl/dnsresolver",
     versions: [
         "1",
         "2",
+        "3",
     ],
 }
 
 cc_library {
     name: "libnetd_resolv",
     version_script: "libnetd_resolv.map.txt",
+    stubs: {
+        versions: [
+            "1",
+        ],
+        symbol_file: "libnetd_resolv.map.txt",
+    },
     defaults: ["netd_defaults"],
     srcs: [
         "getaddrinfo.cpp",
@@ -50,12 +55,14 @@ cc_library {
         "res_mkquery.cpp",
         "res_query.cpp",
         "res_send.cpp",
-        "res_state.cpp",
         "res_stats.cpp",
+        "util.cpp",
         "Dns64Configuration.cpp",
         "DnsProxyListener.cpp",
+        "DnsQueryLog.cpp",
         "DnsResolver.cpp",
         "DnsResolverService.cpp",
+        "DnsStats.cpp",
         "DnsTlsDispatcher.cpp",
         "DnsTlsQueryMap.cpp",
         "DnsTlsTransport.cpp",
@@ -69,7 +76,7 @@ cc_library {
     // Link most things statically to minimize our dependence on system ABIs.
     stl: "libc++_static",
     static_libs: [
-        "dnsresolver_aidl_interface-ndk_platform",
+        "dnsresolver_aidl_interface-unstable-ndk_platform",
         "libbase",
         "libcutils",
         "libjsoncpp",
@@ -77,10 +84,10 @@ cc_library {
         "libnetdutils",
         "libprotobuf-cpp-lite",
         "libstatslog_resolv",
-        "libstatssocket",
+        "libstatspush_compat",
         "libsysutils",
-        "libutils",  // Used by libstatslog_resolv
-        "netd_event_listener_interface-V1-ndk_platform",
+        "libutils", // Used by libstatslog_resolv
+        "netd_event_listener_interface-ndk_platform",
         "server_configurable_flags",
         "stats_proto",
     ],
@@ -104,6 +111,16 @@ cc_library {
                 "-DRESOLV_ALLOW_VERBOSE_LOGGING=1",
                 "-DRESOLV_INJECT_CA_CERTIFICATE=1",
             ],
+        },
+    },
+    header_abi_checker: {
+        enabled: true,
+        symbol_file: "libnetd_resolv.map.txt",
+    },
+    sanitize: {
+        cfi: true,
+        diag: {
+            cfi: true,
         },
     },
 }
@@ -132,7 +149,7 @@ genrule {
 genrule {
     name: "statslog_resolv.cpp",
     tools: ["stats-log-api-gen"],
-    cmd: "$(location stats-log-api-gen) --cpp $(genDir)/statslog_resolv.cpp --module resolv --namespace android,net,stats --importHeader statslog_resolv.h",
+    cmd: "$(location stats-log-api-gen) --cpp $(genDir)/statslog_resolv.cpp --module resolv --namespace android,net,stats --importHeader statslog_resolv.h --supportQ",
     out: [
         "statslog_resolv.cpp",
     ],
@@ -146,63 +163,25 @@ cc_library_static {
     export_generated_headers: ["statslog_resolv.h"],
     static_libs: [
         "libcutils",
-        "libstatssocket",
+        "libgtest_prod", // Used by libstatspush_compat
+        "libstatspush_compat",
     ],
 }
 
-cc_test {
-    name: "resolv_integration_test",
-    test_suites: ["device-tests"],
-    require_root: true,
-    defaults: ["netd_defaults"],
-    tidy: false,  // cuts test build time by > 1m30s
-    srcs: [
-        "tests/dns_responder/dns_responder.cpp",
-        "dnsresolver_binder_test.cpp",
-        "resolv_integration_test.cpp",
-    ],
-    header_libs: [
-        "libnetd_resolv_headers",
-    ],
-    shared_libs: [
-        "libbpf_android",
-        "libbinder",
-        "libcrypto",
-        "liblog",
-        "libnetd_client",
-        "libssl",
-        "libutils",
-    ],
-    static_libs: [
-        "dnsresolver_aidl_interface-cpp",
-        "libbase",
-        "libgmock",
-        "libnetd_test_dnsresponder",
-        "libnetd_test_metrics_listener",
-        "libnetd_test_resolv_utils",
-        "libnetd_test_tun_interface",
-        "libnetd_test_utils",
-        "libnetdutils",
-        "netd_aidl_interface-V2-cpp",
-        "netd_event_listener_interface-V1-cpp",
-    ],
-    compile_multilib: "both",
-    sanitize: {
-        address: true,
-        recover: ["all"],
-    },
-}
-
+// TODO: Move this test to tests/
 cc_test {
     name: "resolv_unit_test",
-    test_suites: ["device-tests"],
+    test_suites: ["device-tests", "mts"],
     require_root: true,
     //TODO:  drop root privileges and make it be an real unit test.
     defaults: ["netd_defaults"],
     srcs: [
         "resolv_cache_unit_test.cpp",
+        "resolv_callback_unit_test.cpp",
         "resolv_tls_unit_test.cpp",
         "resolv_unit_test.cpp",
+        "DnsStatsTest.cpp",
+        "DnsQueryLogTest.cpp",
     ],
     shared_libs: [
         "libbase",
@@ -212,9 +191,8 @@ cc_test {
         "libbinder_ndk",
     ],
     static_libs: [
-        "dnsresolver_aidl_interface-V2-cpp",
-        "dnsresolver_aidl_interface-V2-ndk_platform",
-        "netd_event_listener_interface-V1-ndk_platform",
+        "dnsresolver_aidl_interface-unstable-ndk_platform",
+        "netd_event_listener_interface-ndk_platform",
         "libgmock",
         "liblog",
         "libnetd_resolv",
@@ -222,7 +200,21 @@ cc_test {
         "libnetd_test_resolv_utils",
         "libnetdutils",
         "libprotobuf-cpp-lite",
+        "libstatslog_resolv",
+        "libstatspush_compat",
+        "libsysutils",
+        "libutils",
+        "resolv_stats_test_utils",
         "server_configurable_flags",
         "stats_proto",
     ],
+    compile_multilib: "both",
+    multilib: {
+        lib32: {
+            suffix: "32",
+        },
+        lib64: {
+            suffix: "64",
+        },
+    },
 }

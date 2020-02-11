@@ -25,24 +25,65 @@
 
 #include <netdutils/InternetAddresses.h>
 
-#include "ResolverStats.h"
-
-#include "android/net/IDnsResolver.h"
 #include "dns_responder/dns_responder.h"
-#include "netd_resolv/params.h"
+
+struct DnsRecord {
+    std::string host_name;  // host name
+    ns_type type;           // record type
+    std::string addr;       // ipv4/v6 address
+};
 
 // TODO: make this dynamic and stop depending on implementation details.
 constexpr int TEST_NETID = 30;
-
-// Specifying 0 in ai_socktype or ai_protocol of struct addrinfo indicates that any type or
-// protocol can be returned by getaddrinfo().
-constexpr unsigned int ANY = 0;
 
 static constexpr char kLocalHost[] = "localhost";
 static constexpr char kLocalHostAddr[] = "127.0.0.1";
 static constexpr char kIp6LocalHost[] = "ip6-localhost";
 static constexpr char kIp6LocalHostAddr[] = "::1";
 static constexpr char kHelloExampleCom[] = "hello.example.com.";
+static constexpr char kHelloExampleComAddrV4[] = "1.2.3.4";
+static constexpr char kHelloExampleComAddrV6[] = "::1.2.3.4";
+static constexpr char kExampleComDomain[] = ".example.com";
+
+constexpr size_t kMaxmiumLabelSize = 63;  // see RFC 1035 section 2.3.4.
+
+static const std::vector<uint8_t> kHelloExampleComQueryV4 = {
+        /* Header */
+        0x00, 0x00, /* Transaction ID: 0x0000 */
+        0x01, 0x00, /* Flags: rd */
+        0x00, 0x01, /* Questions: 1 */
+        0x00, 0x00, /* Answer RRs: 0 */
+        0x00, 0x00, /* Authority RRs: 0 */
+        0x00, 0x00, /* Additional RRs: 0 */
+        /* Queries */
+        0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x03,
+        0x63, 0x6f, 0x6d, 0x00, /* Name: hello.example.com */
+        0x00, 0x01,             /* Type: A */
+        0x00, 0x01              /* Class: IN */
+};
+
+static const std::vector<uint8_t> kHelloExampleComResponseV4 = {
+        /* Header */
+        0x00, 0x00, /* Transaction ID: 0x0000 */
+        0x81, 0x80, /* Flags: qr rd ra */
+        0x00, 0x01, /* Questions: 1 */
+        0x00, 0x01, /* Answer RRs: 1 */
+        0x00, 0x00, /* Authority RRs: 0 */
+        0x00, 0x00, /* Additional RRs: 0 */
+        /* Queries */
+        0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x03,
+        0x63, 0x6f, 0x6d, 0x00, /* Name: hello.example.com */
+        0x00, 0x01,             /* Type: A */
+        0x00, 0x01,             /* Class: IN */
+        /* Answers */
+        0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x03,
+        0x63, 0x6f, 0x6d, 0x00, /* Name: hello.example.com */
+        0x00, 0x01,             /* Type: A */
+        0x00, 0x01,             /* Class: IN */
+        0x00, 0x00, 0x00, 0x00, /* Time to live: 0 */
+        0x00, 0x04,             /* Data length: 4 */
+        0x01, 0x02, 0x03, 0x04  /* Address: 1.2.3.4 */
+};
 
 // Illegal hostnames
 static constexpr char kBadCharAfterPeriodHost[] = "hello.example.^com.";
@@ -64,16 +105,40 @@ static const test::DNSHeader kDefaultDnsHeader = {
         .ad = false,            // non-authenticated data is unacceptable
 };
 
+// The CNAME chain records for building a response message which exceeds 512 bytes.
+//
+// Ignoring the other fields of the message, the response message has 8 CNAMEs in 5 answer RRs
+// and each CNAME has 77 bytes as the follows. The response message at least has 616 bytes in
+// answer section and has already exceeded 512 bytes totally.
+//
+// The CNAME is presented as:
+//   0   1            64  65                          72  73          76  77
+//   +---+--........--+---+---+---+---+---+---+---+---+---+---+---+---+---+
+//   | 63| {x, .., x} | 7 | e | x | a | m | p | l | e | 3 | c | o | m | 0 |
+//   +---+--........--+---+---+---+---+---+---+---+---+---+---+---+---+---+
+//          ^-- x = {a, b, c, d}
+//
+const std::string kCnameA = std::string(kMaxmiumLabelSize, 'a') + kExampleComDomain + ".";
+const std::string kCnameB = std::string(kMaxmiumLabelSize, 'b') + kExampleComDomain + ".";
+const std::string kCnameC = std::string(kMaxmiumLabelSize, 'c') + kExampleComDomain + ".";
+const std::string kCnameD = std::string(kMaxmiumLabelSize, 'd') + kExampleComDomain + ".";
+const std::vector<DnsRecord> kLargeCnameChainRecords = {
+        {kHelloExampleCom, ns_type::ns_t_cname, kCnameA},
+        {kCnameA, ns_type::ns_t_cname, kCnameB},
+        {kCnameB, ns_type::ns_t_cname, kCnameC},
+        {kCnameC, ns_type::ns_t_cname, kCnameD},
+        {kCnameD, ns_type::ns_t_a, kHelloExampleComAddrV4},
+};
+
+// TODO: Integrate GetNumQueries relevent functions
 size_t GetNumQueries(const test::DNSResponder& dns, const char* name);
+size_t GetNumQueriesForProtocol(const test::DNSResponder& dns, const int protocol,
+                                const char* name);
 size_t GetNumQueriesForType(const test::DNSResponder& dns, ns_type type, const char* name);
 std::string ToString(const hostent* he);
 std::string ToString(const addrinfo* ai);
 std::string ToString(const android::netdutils::ScopedAddrinfo& ai);
+std::string ToString(const sockaddr_storage* addr);
+std::vector<std::string> ToStrings(const hostent* he);
 std::vector<std::string> ToStrings(const addrinfo* ai);
 std::vector<std::string> ToStrings(const android::netdutils::ScopedAddrinfo& ai);
-
-bool GetResolverInfo(android::net::IDnsResolver* dnsResolverService, unsigned netId,
-                     std::vector<std::string>* servers, std::vector<std::string>* domains,
-                     std::vector<std::string>* tlsServers, res_params* params,
-                     std::vector<android::net::ResolverStats>* stats,
-                     int* wait_for_pending_req_timeout_count);

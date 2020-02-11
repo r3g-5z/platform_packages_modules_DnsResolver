@@ -28,22 +28,27 @@
 
 #pragma once
 
-#include "netd_resolv/resolv.h"
-
-#include <stddef.h>
-
 #include <unordered_map>
 #include <vector>
 
-struct __res_state;
-struct resolv_cache;
+#include <aidl/android/net/IDnsResolver.h>
+#include <aidl/android/net/ResolverExperimentalOptionsParcel.h>
 
-constexpr int DNSEVENT_SUBSAMPLING_MAP_DEFAULT_KEY = -1;
+#include <netdutils/DumpWriter.h>
+#include <netdutils/InternetAddresses.h>
+#include <stats.pb.h>
 
-/* sets the name server addresses to the provided res_state structure. The
- * name servers are retrieved from the cache which is associated
- * with the network to which the res_state structure is associated */
-void _resolv_populate_res_for_net(struct __res_state* statp);
+#include "ResolverStats.h"
+#include "params.h"
+
+// Sets the name server addresses to the provided ResState.
+// The name servers are retrieved from the cache which is associated
+// with the network to which ResState is associated.
+struct ResState;
+
+typedef std::multimap<std::string /* hostname */, std::string /* IPv4/IPv6 address */> HostMapping;
+
+void resolv_populate_res_for_net(ResState* statp);
 
 std::vector<unsigned> resolv_list_caches();
 
@@ -69,15 +74,25 @@ int resolv_cache_add(unsigned netid, const void* query, int querylen, const void
 /* Notify the cache a request failed */
 void _resolv_cache_query_failed(unsigned netid, const void* query, int querylen, uint32_t flags);
 
+// Get a customized table for a given network.
+std::vector<std::string> getCustomizedTableByName(const size_t netid, const char* hostname);
+
 // Sets name servers for a given network.
-int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& servers,
-                           const std::vector<std::string>& domains, const res_params& params);
+// TODO: Pass all of ResolverParamsParcel and remove the res_params argument.
+int resolv_set_nameservers(
+        unsigned netid, const std::vector<std::string>& servers,
+        const std::vector<std::string>& domains, const res_params& params,
+        const aidl::android::net::ResolverExperimentalOptionsParcel& experimentalOptions = {
+                {} /* hosts */, aidl::android::net::IDnsResolver::TC_MODE_DEFAULT});
 
 // Creates the cache associated with the given network.
 int resolv_create_cache_for_net(unsigned netid);
 
 // Deletes the cache associated with the given network.
 void resolv_delete_cache_for_net(unsigned netid);
+
+// Flushes the cache associated with the given network.
+int resolv_flush_cache_for_net(unsigned netid);
 
 // For test only.
 // Return true if the cache is existent in the given network, false otherwise.
@@ -87,3 +102,16 @@ bool has_named_cache(unsigned netid);
 // Get the expiration time of a cache entry. Return 0 on success; otherwise, an negative error is
 // returned if the expiration time can't be acquired.
 int resolv_cache_get_expiration(unsigned netid, const std::vector<char>& query, time_t* expiration);
+
+// Set private DNS servers to DnsStats for a given network.
+int resolv_stats_set_servers_for_dot(unsigned netid, const std::vector<std::string>& servers);
+
+// Add a statistics record to DnsStats for a given network.
+bool resolv_stats_add(unsigned netid, const android::netdutils::IPSockAddr& server,
+                      const android::net::DnsQueryEvent* record);
+
+void resolv_stats_dump(android::netdutils::DumpWriter& dw, unsigned netid);
+
+void resolv_oem_options_dump(android::netdutils::DumpWriter& dw, unsigned netid);
+
+const char* tc_mode_to_str(const int mode);

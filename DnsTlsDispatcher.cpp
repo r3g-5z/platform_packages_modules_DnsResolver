@@ -17,8 +17,11 @@
 #define LOG_TAG "resolv"
 
 #include "DnsTlsDispatcher.h"
+
 #include <netdutils/Stopwatch.h>
+
 #include "DnsTlsSocketFactory.h"
+#include "resolv_cache.h"
 #include "resolv_private.h"
 #include "stats.pb.h"
 
@@ -27,6 +30,7 @@
 namespace android {
 namespace net {
 
+using android::netdutils::IPSockAddr;
 using android::netdutils::Stopwatch;
 using netdutils::Slice;
 
@@ -97,14 +101,17 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const std::list<DnsTlsServer>&
     for (const auto& server : orderedServers) {
         DnsQueryEvent* dnsQueryEvent =
                 statp->event->mutable_dns_query_events()->add_dns_query_event();
+
+        bool connectTriggered = false;
         Stopwatch queryStopwatch;
-        code = this->query(server, statp->_mark, query, ans, resplen);
+        code = this->query(server, statp->_mark, query, ans, resplen, &connectTriggered);
 
         dnsQueryEvent->set_latency_micros(saturate_cast<int32_t>(queryStopwatch.timeTakenUs()));
         dnsQueryEvent->set_dns_server_index(serverCount++);
         dnsQueryEvent->set_ip_version(ipFamilyToIPVersion(server.ss.ss_family));
         dnsQueryEvent->set_protocol(PROTO_DOT);
         dnsQueryEvent->set_type(getQueryType(query.base(), query.size()));
+        dnsQueryEvent->set_connected(connectTriggered);
 
         switch (code) {
             // These response codes are valid responses and not expected to
@@ -112,19 +119,23 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const std::list<DnsTlsServer>&
             case DnsTlsTransport::Response::success:
                 dnsQueryEvent->set_rcode(
                         static_cast<NsRcode>(reinterpret_cast<HEADER*>(ans.base())->rcode));
+                resolv_stats_add(statp->netid, IPSockAddr::toIPSockAddr(server.ss), dnsQueryEvent);
                 return code;
             case DnsTlsTransport::Response::limit_error:
                 dnsQueryEvent->set_rcode(NS_R_INTERNAL_ERROR);
+                resolv_stats_add(statp->netid, IPSockAddr::toIPSockAddr(server.ss), dnsQueryEvent);
                 return code;
             // These response codes might differ when trying other servers, so
             // keep iterating to see if we can get a different (better) result.
             case DnsTlsTransport::Response::network_error:
                 // Sync from res_tls_send in res_send.cpp
                 dnsQueryEvent->set_rcode(NS_R_TIMEOUT);
-                continue;
+                resolv_stats_add(statp->netid, IPSockAddr::toIPSockAddr(server.ss), dnsQueryEvent);
+                break;
             case DnsTlsTransport::Response::internal_error:
                 dnsQueryEvent->set_rcode(NS_R_INTERNAL_ERROR);
-                continue;
+                resolv_stats_add(statp->netid, IPSockAddr::toIPSockAddr(server.ss), dnsQueryEvent);
+                break;
             // No "default" statement.
         }
     }
@@ -133,8 +144,9 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const std::list<DnsTlsServer>&
 }
 
 DnsTlsTransport::Response DnsTlsDispatcher::query(const DnsTlsServer& server, unsigned mark,
-                                                  const Slice query,
-                                                  const Slice ans, int *resplen) {
+                                                  const Slice query, const Slice ans, int* resplen,
+                                                  bool* connectTriggered) {
+    int connectCounter;
     const Key key = std::make_pair(mark, server);
     Transport* xport;
     {
@@ -147,6 +159,7 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const DnsTlsServer& server, un
             xport = it->second.get();
         }
         ++xport->useCount;
+        connectCounter = xport->transport.getConnectCounter();
     }
 
     LOG(DEBUG) << "Sending query of length " << query.size();
@@ -170,6 +183,7 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const DnsTlsServer& server, un
     auto now = std::chrono::steady_clock::now();
     {
         std::lock_guard guard(sLock);
+        *connectTriggered = (xport->transport.getConnectCounter() > connectCounter);
         --xport->useCount;
         xport->lastUsed = now;
         cleanup(now);

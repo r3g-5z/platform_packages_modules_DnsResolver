@@ -46,25 +46,18 @@
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-/*
- *	@(#)resolv.h	8.1 (Berkeley) 6/2/93
- *	Id: resolv.h,v 1.7.2.11.4.2 2004/06/25 00:41:05 marka Exp
- */
-
-#ifndef NETD_RESOLV_PRIVATE_H
-#define NETD_RESOLV_PRIVATE_H
+#pragma once
 
 #include <android-base/logging.h>
 #include <net/if.h>
-#include <resolv.h>
 #include <time.h>
 #include <string>
 #include <vector>
 
 #include "DnsResolver.h"
-#include "netd_resolv/params.h"
 #include "netd_resolv/resolv.h"
-#include "netd_resolv/stats.h"
+#include "params.h"
+#include "stats.h"
 #include "stats.pb.h"
 
 // Linux defines MAXHOSTNAMELEN as 64, while the domain name limit in
@@ -86,10 +79,12 @@ union sockaddr_union {
     struct sockaddr_in sin;
     struct sockaddr_in6 sin6;
 };
+constexpr int MAXPACKET = 8 * 1024;
 
-struct __res_state {
+struct ResState {
     unsigned netid;                           // NetId: cache key and socket mark
     uid_t uid;                                // uid of the app that sent the DNS lookup
+    pid_t pid;                                // pid of the app that sent the DNS lookup
     int nscount;                              // number of name srvers
     uint16_t id;                              // current message id
     std::vector<std::string> search_domains;  // domains to search
@@ -101,9 +96,11 @@ struct __res_state {
     uint32_t _flags;                          // See RES_F_* defines below
     android::net::NetworkDnsEventReported* event;
     uint32_t netcontext_flags;
+    int tc_mode;
 };
 
-typedef struct __res_state* res_state;
+// TODO: remove these legacy aliases
+typedef ResState* res_state;
 
 /* Retrieve a local copy of the stats for the given netid. The buffer must have space for
  * MAXNS __resolver_stats. Returns the revision id of the resolvers used.
@@ -113,8 +110,8 @@ int resolv_cache_get_resolver_stats(unsigned netid, res_params* params, res_stat
 /* Add a sample to the shared struct for the given netid and server, provided that the
  * revision_id of the stored servers has not changed.
  */
-void _resolv_cache_add_resolver_stats_sample(unsigned netid, int revision_id, int ns,
-                                             const res_sample* sample, int max_samples);
+void resolv_cache_add_resolver_stats_sample(unsigned netid, int revision_id, const sockaddr* sa,
+                                            const res_sample& sample, int max_samples);
 
 // Calculate the round-trip-time from start time t0 and end time t1.
 int _res_stats_calculate_rtt(const timespec* t1, const timespec* t0);
@@ -140,32 +137,17 @@ void _res_stats_set_sample(res_sample* sample, time_t now, int rcode, int rtt);
 
 extern const char* const _res_opcodes[];
 
-/* Things involving an internal (static) resolver context. */
-struct __res_state* res_get_state(void);
-
-int res_hnok(const char*);
-int res_ownok(const char*);
-int res_mailok(const char*);
-int res_dnok(const char*);
-int dn_skipname(const uint8_t*, const uint8_t*);
-void putlong(uint32_t, uint8_t*);
-void putshort(uint16_t, uint8_t*);
-
 int res_nameinquery(const char*, int, int, const uint8_t*, const uint8_t*);
 int res_queriesmatch(const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*);
 
 int res_nquery(res_state, const char*, int, int, uint8_t*, int, int*);
 int res_nsearch(res_state, const char*, int, int, uint8_t*, int, int*);
 int res_nquerydomain(res_state, const char*, const char*, int, int, uint8_t*, int, int*);
-int res_nmkquery(res_state, int, const char*, int, int, const uint8_t*, int, const uint8_t*,
-                 uint8_t*, int);
+int res_nmkquery(int op, const char* qname, int cl, int type, const uint8_t* data, int datalen,
+                 uint8_t* buf, int buflen, int netcontext_flags);
 int res_nsend(res_state, const uint8_t*, int, uint8_t*, int, int*, uint32_t);
 void res_nclose(res_state);
 int res_nopt(res_state, int, uint8_t*, int, int);
-
-struct android_net_context;
-void res_setnetcontext(res_state, const struct android_net_context*,
-                       android::net::NetworkDnsEventReported* event);
 
 int getaddrinfo_numeric(const char* hostname, const char* servname, addrinfo hints,
                         addrinfo** result);
@@ -188,9 +170,9 @@ android::net::NsType getQueryType(const uint8_t* msg, size_t msgLen);
 
 android::net::IpVersion ipFamilyToIPVersion(int ipFamily);
 
-inline void resolv_tag_socket(int sock, uid_t uid) {
+inline void resolv_tag_socket(int sock, uid_t uid, pid_t pid) {
     if (android::net::gResNetdCallbacks.tagSocket != nullptr) {
-        if (int err = android::net::gResNetdCallbacks.tagSocket(sock, TAG_SYSTEM_DNS, uid)) {
+        if (int err = android::net::gResNetdCallbacks.tagSocket(sock, TAG_SYSTEM_DNS, uid, pid)) {
             LOG(WARNING) << "Failed to tag socket: " << strerror(-err);
         }
     }
@@ -200,4 +182,9 @@ inline void resolv_tag_socket(int sock, uid_t uid) {
     }
 }
 
-#endif  // NETD_RESOLV_PRIVATE_H
+inline std::string addrToString(const sockaddr_storage* addr) {
+    char out[INET6_ADDRSTRLEN] = {0};
+    getnameinfo((const sockaddr*)addr, sizeof(sockaddr_storage), out, INET6_ADDRSTRLEN, nullptr, 0,
+                NI_NUMERICHOST);
+    return std::string(out);
+}
