@@ -3,11 +3,8 @@ cc_library_headers {
     export_include_dirs: ["include"],
 }
 
-//For the test to use
-//TODO: 1. Need to Refactor ResolverStats related code(ex: ResolverController::getDnsInfo).
-//         Then removing this library header file.
-//      2. Change the imports path in netd/TEST_MAPPING after migrating from
-//         system/netd/resolv to packages/modules/resolv.
+// Used only by dns_responder_client_ndk.cpp for ResolverStats.h
+// TODO: refactor stats to use a Parcel and eliminate this dependency
 cc_library_headers {
     name: "libnetd_resolv_internal_headers",
     export_include_dirs: ["."],
@@ -18,6 +15,8 @@ aidl_interface {
     local_include_dir: "binder",
     srcs: [
         "binder/android/net/IDnsResolver.aidl",
+        "binder/android/net/ResolverHostsParcel.aidl",
+        "binder/android/net/ResolverExperimentalOptionsParcel.aidl",
         "binder/android/net/ResolverParamsParcel.aidl",
     ],
     imports: [
@@ -81,11 +80,10 @@ cc_library {
         "libbase",
         "libcutils",
         "libjsoncpp",
-        "liblog", //Used by libstatslog_resolv
         "libnetdutils",
         "libprotobuf-cpp-lite",
         "libstatslog_resolv",
-        "libstatssocket",
+        "libstatspush_compat",
         "libsysutils",
         "libutils", // Used by libstatslog_resolv
         "netd_event_listener_interface-ndk_platform",
@@ -96,13 +94,24 @@ cc_library {
     // integrity check (against a checksum) that is not supported for static
     // libs. See http://b/141248879
     // We're also adding libssl here to treat it consistently.
+    // liblog is added as a shared library because it provides stable C API
+    // from the platform; we don't need to include it in this module by
+    // statically linking to it. Doing so is even dangerous because the socket
+    // protocol to logd implemented in the library isn't guaranteed to be
+    // stable. See b/151051671
     shared_libs: [
         "libbinder_ndk",
         "libcrypto",
+        "liblog", //Used by libstatslog_resolv
         "libssl",
     ],
     header_libs: [
         "libnetd_client_headers",
+    ],
+    runtime_libs: [
+        // Causes the linkerconfig to create a namespace link from resolv to the
+        // libstatssocket library within the statsd apex
+        "libstatssocket",
     ],
     export_include_dirs: ["include"],
 
@@ -117,6 +126,9 @@ cc_library {
     header_abi_checker: {
         enabled: true,
         symbol_file: "libnetd_resolv.map.txt",
+    },
+    sanitize: {
+        cfi: true,
     },
 }
 
@@ -144,7 +156,7 @@ genrule {
 genrule {
     name: "statslog_resolv.cpp",
     tools: ["stats-log-api-gen"],
-    cmd: "$(location stats-log-api-gen) --cpp $(genDir)/statslog_resolv.cpp --module resolv --namespace android,net,stats --importHeader statslog_resolv.h",
+    cmd: "$(location stats-log-api-gen) --cpp $(genDir)/statslog_resolv.cpp --module resolv --namespace android,net,stats --importHeader statslog_resolv.h --supportQ",
     out: [
         "statslog_resolv.cpp",
     ],
@@ -158,7 +170,8 @@ cc_library_static {
     export_generated_headers: ["statslog_resolv.h"],
     static_libs: [
         "libcutils",
-        "libstatssocket",
+        "libgtest_prod", // Used by libstatspush_compat
+        "libstatspush_compat",
     ],
 }
 
@@ -178,37 +191,29 @@ cc_test {
         "DnsQueryLogTest.cpp",
     ],
     shared_libs: [
-        "libbase",
         "libcrypto",
-        "libcutils",
-        "libssl",
         "libbinder_ndk",
+        "liblog",
+        "libssl",
     ],
     static_libs: [
-        "dnsresolver_aidl_interface-cpp",
-        "dnsresolver_aidl_interface-ndk_platform",
+        "dnsresolver_aidl_interface-unstable-ndk_platform",
         "netd_event_listener_interface-ndk_platform",
+        "libcutils",
+        "libbase",
         "libgmock",
-        "liblog",
         "libnetd_resolv",
         "libnetd_test_dnsresponder",
         "libnetd_test_resolv_utils",
         "libnetdutils",
         "libprotobuf-cpp-lite",
         "libstatslog_resolv",
-        "libstatssocket",
+        "libstatspush_compat",
         "libsysutils",
         "libutils",
+        "resolv_stats_test_utils",
         "server_configurable_flags",
         "stats_proto",
     ],
-    compile_multilib: "both",
-    multilib: {
-        lib32: {
-            suffix: "32",
-        },
-        lib64: {
-            suffix: "64",
-        },
-    },
+    compile_multilib: "first",
 }

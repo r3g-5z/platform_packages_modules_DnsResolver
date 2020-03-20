@@ -46,8 +46,8 @@ class DnsTlsTransport : public IDnsTlsSocketObserver {
         : mMark(mark), mServer(server), mFactory(factory) {}
     ~DnsTlsTransport();
 
-    typedef DnsTlsServer::Response Response;
-    typedef DnsTlsServer::Result Result;
+    using Response = DnsTlsQueryMap::Response;
+    using Result = DnsTlsQueryMap::Result;
 
     // Given a |query|, this method sends it to the server and returns the result asynchronously.
     std::future<Result> query(const netdutils::Slice query) EXCLUDES(mLock);
@@ -57,7 +57,7 @@ class DnsTlsTransport : public IDnsTlsSocketObserver {
     // on networks where it doesn't actually work.
     static bool validate(const DnsTlsServer& server, unsigned netid, uint32_t mark);
 
-    uint32_t getConnectCounter() const EXCLUDES(mLock);
+    int getConnectCounter() const EXCLUDES(mLock);
 
     // Implement IDnsTlsSocketObserver
     void onResponse(std::vector<uint8_t> response) override;
@@ -86,10 +86,10 @@ class DnsTlsTransport : public IDnsTlsSocketObserver {
     std::unique_ptr<IDnsTlsSocket> mSocket GUARDED_BY(mLock);
 
     // Send a query to the socket.
-    bool sendQuery(const DnsTlsQueryMap::Query q) REQUIRES(mLock);
+    bool sendQuery(const DnsTlsQueryMap::Query& q) REQUIRES(mLock);
 
     // The number of times an attempt to connect the nameserver.
-    uint32_t mConnectCounter GUARDED_BY(mLock) = 0;
+    int mConnectCounter GUARDED_BY(mLock) = 0;
 };
 
 }  // end of namespace net

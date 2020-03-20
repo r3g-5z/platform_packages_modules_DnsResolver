@@ -6,7 +6,6 @@ cc_test_library {
     ],
     header_libs: [
         "libnetd_resolv_headers",
-        "libnetd_resolv_internal_headers",
     ],
     shared_libs: [
         "libbase",
@@ -23,7 +22,7 @@ cc_library_static {
     defaults: ["netd_defaults"],
     proto: {
         export_proto_headers: true,
-        type: "full",
+        type: "lite",
     },
     srcs: [
         "golddata.proto",
@@ -34,19 +33,22 @@ cc_test {
     name: "resolv_gold_test",
     test_suites: ["device-tests", "mts"],
     require_root: true,
+    // b/151392634, this is a workaround because MTS
+    // can not handle the test with testdata correctly.
+    // TODO: Remove the xml after MTS fixing the problem.
+    test_config: "resolv_gold_test_config.xml",
     defaults: ["netd_defaults"],
-    data: ["testdata/*.pbtxt"],
+    data: ["testdata/pb/*.pb"],
     srcs: [
         "resolv_gold_test.cpp",
     ],
     header_libs: [
         "libnetd_client_headers",
-        "libnetd_resolv_internal_headers",
     ],
     shared_libs: [
-        "libbinder_ndk",
         "libcrypto",
-        "libprotobuf-cpp-full",
+        "libbinder_ndk",
+        "liblog",
         "libssl",
     ],
     static_libs: [
@@ -54,11 +56,11 @@ cc_test {
         "golddata_proto",
         "libbase",
         "libgmock",
-        "liblog",
         "libnetd_resolv",
         "libnetd_test_dnsresponder_ndk",
         "libnetd_test_resolv_utils",
         "libnetdutils",
+        "libprotobuf-cpp-lite",
         "netd_aidl_interface-ndk_platform",
         "netd_event_listener_interface-ndk_platform",
         "server_configurable_flags",
@@ -79,20 +81,20 @@ cc_test {
     ],
     header_libs: [
         "libnetd_resolv_headers",
-        "libnetd_resolv_internal_headers",
     ],
     shared_libs: [
-        "libbase",
         "libbinder_ndk",
+        "liblog",
         "libnetd_client",
-        "libutils",
     ],
     static_libs: [
         "dnsresolver_aidl_interface-ndk_platform",
+        "libbase",
         "libgmock",
         "libnetd_test_dnsresponder_ndk",
         "libnetd_test_resolv_utils",
         "libnetdutils",
+        "libutils",
         "netd_event_listener_interface-ndk_platform",
         "netd_aidl_interface-ndk_platform",
     ],
@@ -103,6 +105,7 @@ cc_test {
     name: "resolv_integration_test",
     test_suites: ["device-tests", "mts"],
     require_root: true,
+    test_config: "resolv_integration_test_config.xml",
     defaults: ["netd_defaults"],
     tidy: false, // cuts test build time by > 1m30s
     srcs: [
@@ -112,12 +115,12 @@ cc_test {
     ],
     header_libs: [
         "libnetd_resolv_headers",
-        "libnetd_resolv_internal_headers",
     ],
     // TODO: make static link libc++ work.
     //stl: "libc++_static",
     shared_libs: [
         "libbinder_ndk",
+        "liblog",
         "libnetd_client",
     ],
     static_libs: [
@@ -126,7 +129,6 @@ cc_test {
         "libbpf_android",
         "libcrypto_static",
         "libgmock",
-        "liblog",
         "libnetd_test_dnsresponder_ndk",
         "libnetd_test_metrics_listener",
         "libnetd_test_resolv_utils",
@@ -147,4 +149,42 @@ cc_test {
             suffix: "64",
         },
     },
+}
+
+cc_test_library {
+    name: "resolv_stats_test_utils",
+    srcs: [
+        "resolv_stats_test_utils.cpp"
+    ],
+    defaults: ["netd_defaults"],
+    export_include_dirs: ["."],
+    shared_libs: [
+        "liblog",
+    ],
+    static_libs: [
+        "libbase",
+        "libgmock",
+        "libnetdutils",
+        "libprotobuf-cpp-lite",
+        "stats_proto",
+    ],
+}
+
+cc_test {
+    name: "resolv_stats_test_utils_test",
+    srcs: [
+        "resolv_stats_test_utils_test.cpp",
+    ],
+    defaults: ["netd_defaults"],
+    test_suites: ["device-tests"],
+    shared_libs: [
+        "liblog",
+    ],
+    static_libs: [
+        "libbase",
+        "libgmock",
+        "libprotobuf-cpp-lite",
+        "resolv_stats_test_utils",
+        "stats_proto",
+    ],
 }

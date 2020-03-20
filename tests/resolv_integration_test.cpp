@@ -81,6 +81,8 @@ extern "C" int android_getaddrinfofornet(const char* hostname, const char* servn
                                          const addrinfo* hints, unsigned netid, unsigned mark,
                                          struct addrinfo** result);
 
+using namespace std::chrono_literals;
+
 using aidl::android::net::IDnsResolver;
 using aidl::android::net::INetd;
 using aidl::android::net::ResolverParamsParcel;
@@ -115,11 +117,38 @@ std::pair<ScopedAddrinfo, int> safe_getaddrinfo_time_taken(const char* node, con
     return {std::move(result), s.timeTakenUs() / 1000};
 }
 
+struct NameserverStats {
+    NameserverStats() = delete;
+    NameserverStats(const std::string server) : server(server) {}
+    NameserverStats& setSuccesses(int val) {
+        successes = val;
+        return *this;
+    }
+    NameserverStats& setErrors(int val) {
+        errors = val;
+        return *this;
+    }
+    NameserverStats& setTimeouts(int val) {
+        timeouts = val;
+        return *this;
+    }
+    NameserverStats& setInternalErrors(int val) {
+        internal_errors = val;
+        return *this;
+    }
+
+    const std::string server;
+    int successes = 0;
+    int errors = 0;
+    int timeouts = 0;
+    int internal_errors = 0;
+};
+
 }  // namespace
 
 class ResolverTest : public ::testing::Test {
   public:
-    static void SetUpTestCase() {
+    static void SetUpTestSuite() {
         // Get binder service.
         // Note that |mDnsClient| is not used for getting binder service in this static function.
         // The reason is that wants to keep |mDnsClient| as a non-static data member. |mDnsClient|
@@ -153,17 +182,16 @@ class ResolverTest : public ::testing::Test {
         // recipient.
         ABinderProcess_startThreadPool();
     }
-    static void TearDownTestCase() { AIBinder_DeathRecipient_delete(sResolvDeathRecipient); }
+    static void TearDownTestSuite() { AIBinder_DeathRecipient_delete(sResolvDeathRecipient); }
 
   protected:
-    struct DnsRecord {
-        std::string host_name;  // host name
-        ns_type type;           // record type
-        std::string addr;       // ipv4/v6 address
-    };
-
     void SetUp() { mDnsClient.SetUp(); }
-    void TearDown() { mDnsClient.TearDown(); }
+    void TearDown() {
+        // Ensure the dump works at the end of each test.
+        DumpResolverService();
+
+        mDnsClient.TearDown();
+    }
 
     void StartDns(test::DNSResponder& dns, const std::vector<DnsRecord>& records) {
         for (const auto& r : records) {
@@ -174,6 +202,14 @@ class ResolverTest : public ::testing::Test {
         dns.clearQueries();
     }
 
+    void DumpResolverService() {
+        unique_fd fd(open("/dev/null", O_WRONLY));
+        EXPECT_EQ(mDnsClient.resolvService()->dump(fd, nullptr, 0), 0);
+
+        const char* querylogCmd[] = {"querylog"};  // Keep it sync with DnsQueryLog::DUMP_KEYWORD.
+        EXPECT_EQ(mDnsClient.resolvService()->dump(fd, querylogCmd, std::size(querylogCmd)), 0);
+    }
+
     bool WaitForNat64Prefix(ExpectNat64PrefixStatus status,
                             std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
         return sDnsMetricsListener->waitForNat64Prefix(status, timeout);
@@ -181,6 +217,69 @@ class ResolverTest : public ::testing::Test {
 
     bool WaitForPrivateDnsValidation(std::string serverAddr, bool validated) {
         return sDnsMetricsListener->waitForPrivateDnsValidation(serverAddr, validated);
+    }
+
+    bool hasUncaughtPrivateDnsValidation(const std::string& serverAddr) {
+        return sDnsMetricsListener->findValidationRecord(serverAddr);
+    }
+
+    bool expectStatsFromGetResolverInfo(const std::vector<NameserverStats>& nameserversStats) {
+        std::vector<std::string> res_servers;
+        std::vector<std::string> res_domains;
+        std::vector<std::string> res_tls_servers;
+        res_params res_params;
+        std::vector<ResolverStats> res_stats;
+        int wait_for_pending_req_timeout_count;
+
+        if (!DnsResponderClient::GetResolverInfo(mDnsClient.resolvService(), TEST_NETID,
+                                                 &res_servers, &res_domains, &res_tls_servers,
+                                                 &res_params, &res_stats,
+                                                 &wait_for_pending_req_timeout_count)) {
+            ADD_FAILURE() << "GetResolverInfo failed";
+            return false;
+        }
+
+        if (res_servers.size() != res_stats.size()) {
+            ADD_FAILURE() << fmt::format("res_servers.size() != res_stats.size(): {} != {}",
+                                         res_servers.size(), res_stats.size());
+            return false;
+        }
+        if (res_servers.size() != nameserversStats.size()) {
+            ADD_FAILURE() << fmt::format("res_servers.size() != nameserversStats.size(): {} != {}",
+                                         res_servers.size(), nameserversStats.size());
+            return false;
+        }
+
+        for (const auto& stats : nameserversStats) {
+            SCOPED_TRACE(stats.server);
+            const auto it = std::find(res_servers.begin(), res_servers.end(), stats.server);
+            if (it == res_servers.end()) {
+                ADD_FAILURE() << fmt::format("nameserver {} not found in the list {{{}}}",
+                                             stats.server, fmt::join(res_servers, ", "));
+                return false;
+            }
+            const int index = std::distance(res_servers.begin(), it);
+
+            // The check excludes rtt_avg, last_sample_time, and usable since they will be obsolete
+            // after |res_stats| is retrieved from NetConfig.dnsStats rather than NetConfig.nsstats.
+            EXPECT_EQ(res_stats[index].successes, stats.successes);
+            EXPECT_EQ(res_stats[index].errors, stats.errors);
+            EXPECT_EQ(res_stats[index].timeouts, stats.timeouts);
+            EXPECT_EQ(res_stats[index].internal_errors, stats.internal_errors);
+        }
+
+        return true;
+    }
+
+    // Since there's no way to terminate private DNS validation threads at any time. Tests that
+    // focus on the results of private DNS validation can interfere with each other if they use the
+    // same IP address for test servers. getUniqueIPv4Address() is a workaround to reduce the
+    // possibility of tests being flaky. A feasible solution is to forbid the validation threads,
+    // which are considered as outdated (e.g. switch the resolver to private DNS OFF mode), updating
+    // the result to the PrivateDnsConfiguration instance.
+    static std::string getUniqueIPv4Address() {
+        static int counter = 0;
+        return fmt::format("127.0.100.{}", (++counter & 0xff));
     }
 
     DnsResponderClient mDnsClient;
@@ -193,11 +292,11 @@ class ResolverTest : public ::testing::Test {
     // TODO: Perhaps add an unregistering listener binder call or fork a listener process which
     // could be terminated earlier.
     static std::shared_ptr<DnsMetricsListener>
-            sDnsMetricsListener;  // Initialized in SetUpTestCase.
+            sDnsMetricsListener;  // Initialized in SetUpTestSuite.
 
     // Use a shared static death recipient to monitor the service death. The static death
     // recipient could monitor the death not only during the test but also between tests.
-    static AIBinder_DeathRecipient* sResolvDeathRecipient;  // Initialized in SetUpTestCase.
+    static AIBinder_DeathRecipient* sResolvDeathRecipient;  // Initialized in SetUpTestSuite.
 };
 
 // Initialize static member of class.
@@ -563,7 +662,6 @@ TEST_F(ResolverTest, GetAddrInfo_InvalidSocketType) {
     const addrinfo hints = {
             .ai_family = AF_UNSPEC,
             .ai_socktype = SOCK_PACKET,
-            .ai_protocol = ANY,
     };
     addrinfo* result = nullptr;
     // This is a valid hint, but the query won't be sent because the socket type is
@@ -935,23 +1033,12 @@ TEST_F(ResolverTest, SkipBadServersDueToInternalError) {
         EXPECT_TRUE(safe_getaddrinfo(hostName.c_str(), nullptr, &hints) != nullptr);
     }
 
-    std::vector<std::string> res_servers;
-    std::vector<std::string> res_domains;
-    std::vector<std::string> res_tls_servers;
-    res_params res_params;
-    std::vector<ResolverStats> res_stats;
-    int wait_for_pending_req_timeout_count;
-    ASSERT_TRUE(DnsResponderClient::GetResolverInfo(
-            mDnsClient.resolvService(), TEST_NETID, &res_servers, &res_domains, &res_tls_servers,
-            &res_params, &res_stats, &wait_for_pending_req_timeout_count));
-
-    // Verify the result by means of the statistics.
-    EXPECT_EQ(res_stats[0].successes, 0);
-    EXPECT_EQ(res_stats[1].successes, 0);
-    EXPECT_EQ(res_stats[2].successes, 5);
-    EXPECT_EQ(res_stats[0].internal_errors, 2);
-    EXPECT_EQ(res_stats[1].internal_errors, 2);
-    EXPECT_EQ(res_stats[2].internal_errors, 0);
+    const std::vector<NameserverStats> expectedCleartextDnsStats = {
+            NameserverStats(listen_addr1).setInternalErrors(2),
+            NameserverStats(listen_addr2).setInternalErrors(2),
+            NameserverStats(listen_addr3).setSuccesses(5),
+    };
+    EXPECT_TRUE(expectStatsFromGetResolverInfo(expectedCleartextDnsStats));
 }
 
 TEST_F(ResolverTest, SkipBadServersDueToTimeout) {
@@ -981,23 +1068,150 @@ TEST_F(ResolverTest, SkipBadServersDueToTimeout) {
         EXPECT_TRUE(safe_getaddrinfo(hostName.c_str(), nullptr, &hints) != nullptr);
     }
 
-    std::vector<std::string> res_servers;
-    std::vector<std::string> res_domains;
-    std::vector<std::string> res_tls_servers;
-    res_params res_params;
-    std::vector<ResolverStats> res_stats;
-    int wait_for_pending_req_timeout_count;
-    ASSERT_TRUE(DnsResponderClient::GetResolverInfo(
-            mDnsClient.resolvService(), TEST_NETID, &res_servers, &res_domains, &res_tls_servers,
-            &res_params, &res_stats, &wait_for_pending_req_timeout_count));
-
-    // Verify the result by means of the statistics as well as the query counts.
-    EXPECT_EQ(res_stats[0].successes, 0);
-    EXPECT_EQ(res_stats[1].successes, 5);
-    EXPECT_EQ(res_stats[0].timeouts, 2);
-    EXPECT_EQ(res_stats[1].timeouts, 0);
+    const std::vector<NameserverStats> expectedCleartextDnsStats = {
+            NameserverStats(listen_addr1).setTimeouts(2),
+            NameserverStats(listen_addr2).setSuccesses(5),
+    };
+    EXPECT_TRUE(expectStatsFromGetResolverInfo(expectedCleartextDnsStats));
     EXPECT_EQ(dns1.queries().size(), 2U);
     EXPECT_EQ(dns2.queries().size(), 5U);
+}
+
+TEST_F(ResolverTest, GetAddrInfoFromCustTable_InvalidInput) {
+    constexpr char hostnameNoip[] = "noip.example.com.";
+    constexpr char hostnameInvalidip[] = "invalidip.example.com.";
+    const std::vector<aidl::android::net::ResolverHostsParcel> invalidCustHosts = {
+            {"", hostnameNoip},
+            {"wrong IP", hostnameInvalidip},
+    };
+    test::DNSResponder dns;
+    StartDns(dns, {});
+    auto resolverParams = DnsResponderClient::GetDefaultResolverParamsParcel();
+    resolverParams.experimentalOptions.hosts = invalidCustHosts;
+    ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+    for (const auto& hostname : {hostnameNoip, hostnameInvalidip}) {
+        // The query won't get data from customized table because of invalid customized table
+        // and DNSResponder also has no records. hostnameNoip has never registered and
+        // hostnameInvalidip has registered but wrong IP.
+        const addrinfo hints = {.ai_family = AF_UNSPEC};
+        ScopedAddrinfo result = safe_getaddrinfo(hostname, nullptr, &hints);
+        ASSERT_TRUE(result == nullptr);
+        EXPECT_EQ(4U, GetNumQueries(dns, hostname));
+    }
+}
+
+TEST_F(ResolverTest, GetAddrInfoFromCustTable) {
+    constexpr char hostnameV4[] = "v4only.example.com.";
+    constexpr char hostnameV6[] = "v6only.example.com.";
+    constexpr char hostnameV4V6[] = "v4v6.example.com.";
+    constexpr char custAddrV4[] = "1.2.3.4";
+    constexpr char custAddrV6[] = "::1.2.3.4";
+    constexpr char dnsSvAddrV4[] = "1.2.3.5";
+    constexpr char dnsSvAddrV6[] = "::1.2.3.5";
+    const std::vector<aidl::android::net::ResolverHostsParcel> custHostV4 = {
+            {custAddrV4, hostnameV4},
+    };
+    const std::vector<aidl::android::net::ResolverHostsParcel> custHostV6 = {
+            {custAddrV6, hostnameV6},
+    };
+    const std::vector<aidl::android::net::ResolverHostsParcel> custHostV4V6 = {
+            {custAddrV4, hostnameV4V6},
+            {custAddrV6, hostnameV4V6},
+    };
+    const std::vector<DnsRecord> dnsSvHostV4 = {
+            {hostnameV4, ns_type::ns_t_a, dnsSvAddrV4},
+    };
+    const std::vector<DnsRecord> dnsSvHostV6 = {
+            {hostnameV6, ns_type::ns_t_aaaa, dnsSvAddrV6},
+    };
+    const std::vector<DnsRecord> dnsSvHostV4V6 = {
+            {hostnameV4V6, ns_type::ns_t_a, dnsSvAddrV4},
+            {hostnameV4V6, ns_type::ns_t_aaaa, dnsSvAddrV6},
+    };
+    struct TestConfig {
+        const std::string name;
+        const std::vector<aidl::android::net::ResolverHostsParcel> customizedHosts;
+        const std::vector<DnsRecord> dnsserverHosts;
+        const std::vector<std::string> queryResult;
+        std::string asParameters() const {
+            return StringPrintf("name: %s, customizedHosts: %s, dnsserverHosts: %s", name.c_str(),
+                                customizedHosts.empty() ? "No" : "Yes",
+                                dnsserverHosts.empty() ? "No" : "Yes");
+        }
+    } testConfigs[]{
+            // clang-format off
+            {hostnameV4,    {},            {},             {}},
+            {hostnameV4,    {},            dnsSvHostV4,    {dnsSvAddrV4}},
+            {hostnameV4,    custHostV4,    {},             {custAddrV4}},
+            {hostnameV4,    custHostV4,    dnsSvHostV4,    {custAddrV4}},
+            {hostnameV6,    {},            {},             {}},
+            {hostnameV6,    {},            dnsSvHostV6,    {dnsSvAddrV6}},
+            {hostnameV6,    custHostV6,    {},             {custAddrV6}},
+            {hostnameV6,    custHostV6,    dnsSvHostV6,    {custAddrV6}},
+            {hostnameV4V6,  {},            {},             {}},
+            {hostnameV4V6,  {},            dnsSvHostV4V6,  {dnsSvAddrV4, dnsSvAddrV6}},
+            {hostnameV4V6,  custHostV4V6,  {},             {custAddrV4, custAddrV6}},
+            {hostnameV4V6,  custHostV4V6,  dnsSvHostV4V6,  {custAddrV4, custAddrV6}},
+            // clang-format on
+    };
+
+    for (const auto& config : testConfigs) {
+        SCOPED_TRACE(config.asParameters());
+
+        test::DNSResponder dns;
+        StartDns(dns, config.dnsserverHosts);
+
+        auto resolverParams = DnsResponderClient::GetDefaultResolverParamsParcel();
+        resolverParams.experimentalOptions.hosts = config.customizedHosts;
+        ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+        const addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
+        ScopedAddrinfo result = safe_getaddrinfo(config.name.c_str(), nullptr, &hints);
+        if (config.customizedHosts.empty() && config.dnsserverHosts.empty()) {
+            ASSERT_TRUE(result == nullptr);
+            EXPECT_EQ(2U, GetNumQueries(dns, config.name.c_str()));
+        } else {
+            ASSERT_TRUE(result != nullptr);
+            EXPECT_THAT(ToStrings(result), testing::UnorderedElementsAreArray(config.queryResult));
+            EXPECT_EQ(config.customizedHosts.empty() ? 2U : 0U,
+                      GetNumQueries(dns, config.name.c_str()));
+        }
+
+        EXPECT_TRUE(mDnsClient.resolvService()->flushNetworkCache(TEST_NETID).isOk());
+    }
+}
+
+TEST_F(ResolverTest, GetAddrInfoFromCustTable_Modify) {
+    constexpr char hostnameV4V6[] = "v4v6.example.com.";
+    constexpr char custAddrV4[] = "1.2.3.4";
+    constexpr char custAddrV6[] = "::1.2.3.4";
+    constexpr char dnsSvAddrV4[] = "1.2.3.5";
+    constexpr char dnsSvAddrV6[] = "::1.2.3.5";
+    const std::vector<DnsRecord> dnsSvHostV4V6 = {
+            {hostnameV4V6, ns_type::ns_t_a, dnsSvAddrV4},
+            {hostnameV4V6, ns_type::ns_t_aaaa, dnsSvAddrV6},
+    };
+    const std::vector<aidl::android::net::ResolverHostsParcel> custHostV4V6 = {
+            {custAddrV4, hostnameV4V6},
+            {custAddrV6, hostnameV4V6},
+    };
+    test::DNSResponder dns;
+    StartDns(dns, dnsSvHostV4V6);
+    auto resolverParams = DnsResponderClient::GetDefaultResolverParamsParcel();
+
+    resolverParams.experimentalOptions.hosts = custHostV4V6;
+    ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+    const addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
+    ScopedAddrinfo result = safe_getaddrinfo(hostnameV4V6, nullptr, &hints);
+    ASSERT_TRUE(result != nullptr);
+    EXPECT_THAT(ToStrings(result), testing::UnorderedElementsAreArray({custAddrV4, custAddrV6}));
+    EXPECT_EQ(0U, GetNumQueries(dns, hostnameV4V6));
+
+    resolverParams.experimentalOptions.hosts = {};
+    ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+    result = safe_getaddrinfo(hostnameV4V6, nullptr, &hints);
+    ASSERT_TRUE(result != nullptr);
+    EXPECT_THAT(ToStrings(result), testing::UnorderedElementsAreArray({dnsSvAddrV4, dnsSvAddrV6}));
+    EXPECT_EQ(2U, GetNumQueries(dns, hostnameV4V6));
 }
 
 TEST_F(ResolverTest, EmptySetup) {
@@ -1241,19 +1455,70 @@ TEST_F(ResolverTest, ResolverStats) {
     std::string result_str = ToString(result);
     EXPECT_TRUE(result_str == "1.2.3.4") << ", result_str='" << result_str << "'";
 
-    std::vector<std::string> res_servers;
-    std::vector<std::string> res_domains;
-    std::vector<std::string> res_tls_servers;
-    res_params res_params;
-    std::vector<ResolverStats> res_stats;
-    int wait_for_pending_req_timeout_count;
-    ASSERT_TRUE(DnsResponderClient::GetResolverInfo(
-            mDnsClient.resolvService(), TEST_NETID, &res_servers, &res_domains, &res_tls_servers,
-            &res_params, &res_stats, &wait_for_pending_req_timeout_count));
+    const std::vector<NameserverStats> expectedCleartextDnsStats = {
+            NameserverStats(listen_addr1).setTimeouts(1),
+            NameserverStats(listen_addr2).setErrors(1),
+            NameserverStats(listen_addr3).setSuccesses(1),
+    };
+    EXPECT_TRUE(expectStatsFromGetResolverInfo(expectedCleartextDnsStats));
+}
 
-    EXPECT_EQ(1, res_stats[0].timeouts);
-    EXPECT_EQ(1, res_stats[1].errors);
-    EXPECT_EQ(1, res_stats[2].successes);
+TEST_F(ResolverTest, AlwaysUseLatestSetupParamsInLookups) {
+    constexpr char listen_addr1[] = "127.0.0.3";
+    constexpr char listen_addr2[] = "255.255.255.255";
+    constexpr char listen_addr3[] = "127.0.0.4";
+    constexpr char hostname[] = "hello";
+    constexpr char fqdn_with_search_domain[] = "hello.domain2.com.";
+
+    test::DNSResponder dns1(listen_addr1, test::kDefaultListenService, static_cast<ns_rcode>(-1));
+    dns1.setResponseProbability(0.0);
+    ASSERT_TRUE(dns1.startServer());
+
+    test::DNSResponder dns3(listen_addr3);
+    StartDns(dns3, {{fqdn_with_search_domain, ns_type::ns_t_a, "1.2.3.4"}});
+
+    ResolverParamsParcel parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+    parcel.tlsServers.clear();
+    parcel.servers = {listen_addr1, listen_addr2};
+    parcel.domains = {"domain1.com", "domain2.com"};
+    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+    // Expect the things happening in t1:
+    //   1. The lookup starts using the first domain for query. It sends queries to the populated
+    //      nameserver list {listen_addr1, listen_addr2} for the hostname "hello.domain1.com".
+    //   2. A different list of nameservers is updated to the resolver. Revision ID is incremented.
+    //   3. The query for the hostname times out. The lookup fails to add the timeout record to the
+    //      the stats because of the unmatched revision ID.
+    //   4. The lookup starts using the second domain for query. It sends queries to the populated
+    //      nameserver list {listen_addr3, listen_addr1, listen_addr2} for another hostname
+    //      "hello.domain2.com".
+    //   5. The lookup gets the answer and updates a success record to the stats.
+    std::thread t1([&hostname]() {
+        const addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_DGRAM};
+        ScopedAddrinfo result = safe_getaddrinfo(hostname, nullptr, &hints);
+        EXPECT_NE(result.get(), nullptr);
+        EXPECT_EQ(ToString(result), "1.2.3.4");
+    });
+
+    // Wait for t1 to start the step 1.
+    while (dns1.queries().size() == 0) {
+        usleep(1000);
+    }
+
+    // Update the resolver with three nameservers. This will increment the revision ID.
+    parcel.servers = {listen_addr3, listen_addr1, listen_addr2};
+    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+    t1.join();
+    EXPECT_EQ(0U, GetNumQueriesForType(dns3, ns_type::ns_t_aaaa, fqdn_with_search_domain));
+    EXPECT_EQ(1U, GetNumQueriesForType(dns3, ns_type::ns_t_a, fqdn_with_search_domain));
+
+    const std::vector<NameserverStats> expectedCleartextDnsStats = {
+            NameserverStats(listen_addr1),
+            NameserverStats(listen_addr2),
+            NameserverStats(listen_addr3).setSuccesses(1),
+    };
+    EXPECT_TRUE(expectStatsFromGetResolverInfo(expectedCleartextDnsStats));
 }
 
 // Test what happens if the specified TLS server is nonexistent.
@@ -1365,7 +1630,7 @@ TEST_F(ResolverTest, GetHostByName_Tls) {
     EXPECT_EQ("1.2.3.1", ToString(result));
 
     // Wait for query to get counted.
-    EXPECT_TRUE(tls.waitForQueries(2, 5000));
+    EXPECT_TRUE(tls.waitForQueries(2));
 
     // Stop the TLS server.  Since we're in opportunistic mode, queries will
     // fall back to the locally-assigned (clear text) nameservers.
@@ -1377,8 +1642,8 @@ TEST_F(ResolverTest, GetHostByName_Tls) {
     EXPECT_EQ("1.2.3.2", ToString(result));
     const auto queries = dns.queries();
     EXPECT_EQ(1U, queries.size());
-    EXPECT_EQ("tls2.example.com.", queries[0].first);
-    EXPECT_EQ(ns_t_a, queries[0].second);
+    EXPECT_EQ("tls2.example.com.", queries[0].name);
+    EXPECT_EQ(ns_t_a, queries[0].type);
 
     // Reset the resolvers without enabling TLS.  Queries should still be routed
     // to the UDP endpoint.
@@ -1426,7 +1691,7 @@ TEST_F(ResolverTest, GetHostByName_TlsFailover) {
     EXPECT_EQ("1.2.3.1", ToString(result));
 
     // Wait for query to get counted.
-    EXPECT_TRUE(tls1.waitForQueries(2, 5000));
+    EXPECT_TRUE(tls1.waitForQueries(2));
     // No new queries should have reached tls2.
     EXPECT_EQ(1, tls2.queries());
 
@@ -1437,7 +1702,7 @@ TEST_F(ResolverTest, GetHostByName_TlsFailover) {
     EXPECT_EQ("1.2.3.4", ToString(result));
 
     // Wait for query to get counted.
-    EXPECT_TRUE(tls2.waitForQueries(2, 5000));
+    EXPECT_TRUE(tls2.waitForQueries(2));
 
     // No additional queries should have reached the insecure servers.
     EXPECT_EQ(2U, dns1.queries().size());
@@ -1503,7 +1768,7 @@ TEST_F(ResolverTest, GetAddrInfo_Tls) {
     EXPECT_TRUE(result_str == "1.2.3.4" || result_str == "::1.2.3.4")
             << ", result_str='" << result_str << "'";
     // Wait for both A and AAAA queries to get counted.
-    EXPECT_TRUE(tls.waitForQueries(3, 5000));
+    EXPECT_TRUE(tls.waitForQueries(3));
 
     // Clear TLS bit.
     ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
@@ -1588,21 +1853,19 @@ TEST_F(ResolverTest, TlsBypass) {
         if (config.mode == OFF) {
             ASSERT_TRUE(mDnsClient.SetResolversForNetwork(servers, kDefaultSearchDomains,
                                                           kDefaultParams));
-        } else if (config.mode == OPPORTUNISTIC) {
+        } else /* OPPORTUNISTIC or STRICT */ {
+            const char* tls_hostname = (config.mode == STRICT) ? kDefaultPrivateDnsHostName : "";
             ASSERT_TRUE(mDnsClient.SetResolversWithTls(servers, kDefaultSearchDomains,
-                                                       kDefaultParams, ""));
+                                                       kDefaultParams, tls_hostname));
 
             // Wait for the validation event. If the server is running, the validation should
-            // be successful; otherwise, the validation should be failed.
+            // succeed; otherwise, the validation should fail.
             EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), config.withWorkingTLS));
-        } else if (config.mode == STRICT) {
-            ASSERT_TRUE(mDnsClient.SetResolversWithTls(servers, kDefaultSearchDomains,
-                                                       kDefaultParams, kDefaultPrivateDnsHostName));
-
-            // Wait for the validation event.
-            EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), config.withWorkingTLS));
+            if (config.withWorkingTLS) {
+                EXPECT_TRUE(tls.waitForQueries(1));
+                tls.clearQueries();
+            }
         }
-        tls.clearQueries();
 
         const hostent* h_result = nullptr;
         ScopedAddrinfo ai_result;
@@ -2094,6 +2357,52 @@ TEST_F(ResolverTest, Async_CacheFlags) {
     EXPECT_EQ(4U, GetNumQueries(dns, another_host_name));
 }
 
+TEST_F(ResolverTest, Async_NoCacheStoreFlagDoesNotRefreshStaleCacheEntry) {
+    constexpr char listen_addr[] = "127.0.0.4";
+    constexpr char host_name[] = "howdy.example.com.";
+    const std::vector<DnsRecord> records = {
+            {host_name, ns_type::ns_t_a, "1.2.3.4"},
+    };
+
+    test::DNSResponder dns(listen_addr);
+    StartDns(dns, records);
+    std::vector<std::string> servers = {listen_addr};
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork(servers));
+
+    const unsigned SHORT_TTL_SEC = 1;
+    dns.setTtl(SHORT_TTL_SEC);
+
+    // Refer to b/148842821 for the purpose of below test steps.
+    // Basically, this test is used to ensure stale cache case is handled
+    // correctly with ANDROID_RESOLV_NO_CACHE_STORE.
+    int fd = resNetworkQuery(TEST_NETID, "howdy.example.com", ns_c_in, ns_t_a, 0);
+    EXPECT_TRUE(fd != -1);
+    expectAnswersValid(fd, AF_INET, "1.2.3.4");
+
+    EXPECT_EQ(1U, GetNumQueries(dns, host_name));
+    dns.clearQueries();
+
+    // Wait until cache expired
+    sleep(SHORT_TTL_SEC + 0.5);
+
+    // Now request the same hostname again.
+    // We should see a new DNS query because the entry in cache has become stale.
+    // Due to ANDROID_RESOLV_NO_CACHE_STORE, this query must *not* refresh that stale entry.
+    fd = resNetworkQuery(TEST_NETID, "howdy.example.com", ns_c_in, ns_t_a,
+                         ANDROID_RESOLV_NO_CACHE_STORE);
+    EXPECT_TRUE(fd != -1);
+    expectAnswersValid(fd, AF_INET, "1.2.3.4");
+    EXPECT_EQ(1U, GetNumQueries(dns, host_name));
+    dns.clearQueries();
+
+    // If the cache is still stale, we expect to see one more DNS query
+    // (this time the cache will be refreshed, but we're not checking for it).
+    fd = resNetworkQuery(TEST_NETID, "howdy.example.com", ns_c_in, ns_t_a, 0);
+    EXPECT_TRUE(fd != -1);
+    expectAnswersValid(fd, AF_INET, "1.2.3.4");
+    EXPECT_EQ(1U, GetNumQueries(dns, host_name));
+}
+
 TEST_F(ResolverTest, Async_NoRetryFlag) {
     constexpr char listen_addr0[] = "127.0.0.4";
     constexpr char listen_addr1[] = "127.0.0.6";
@@ -2228,10 +2537,21 @@ TEST_F(ResolverTest, BrokenEdns) {
     typedef test::DNSResponder::Edns Edns;
     enum ExpectResult { EXPECT_FAILURE, EXPECT_SUCCESS };
 
+    // Perform cleartext query in off mode.
     const char OFF[] = "off";
+
+    // Perform cleartext query when there's no private DNS server validated in opportunistic mode.
     const char OPPORTUNISTIC_UDP[] = "opportunistic_udp";
+
+    // Perform cleartext query when there is a private DNS server validated in opportunistic mode.
+    const char OPPORTUNISTIC_FALLBACK_UDP[] = "opportunistic_fallback_udp";
+
+    // Perform cyphertext query in opportunistic mode.
     const char OPPORTUNISTIC_TLS[] = "opportunistic_tls";
+
+    // Perform cyphertext query in strict mode.
     const char STRICT[] = "strict";
+
     const char GETHOSTBYNAME[] = "gethostbyname";
     const char GETADDRINFO[] = "getaddrinfo";
     const char ADDR4[] = "192.0.2.1";
@@ -2239,6 +2559,9 @@ TEST_F(ResolverTest, BrokenEdns) {
     const char CLEARTEXT_PORT[] = "53";
     const char TLS_PORT[] = "853";
     const std::vector<std::string> servers = {CLEARTEXT_ADDR};
+    ResolverParamsParcel paramsForCleanup = DnsResponderClient::GetDefaultResolverParamsParcel();
+    paramsForCleanup.servers.clear();
+    paramsForCleanup.tlsServers.clear();
 
     test::DNSResponder dns(CLEARTEXT_ADDR, CLEARTEXT_PORT, ns_rcode::ns_r_servfail);
     ASSERT_TRUE(dns.startServer());
@@ -2271,33 +2594,47 @@ TEST_F(ResolverTest, BrokenEdns) {
             return StringPrintf("%s.%s.%s.", mode.c_str(), method.c_str(), ednsString);
         }
     } testConfigs[] = {
-            // In OPPORTUNISTIC_TLS, we get no answer if the DNS server supports TLS but not EDNS0.
-            // Could such server exist? if so, we might need to fallback to query cleartext DNS.
+            // In OPPORTUNISTIC_TLS, if the DNS server doesn't support EDNS0 but TLS, the lookup
+            // fails. Could such server exist? if so, we might need to fix it to fallback to
+            // cleartext query. If the server still make no response for the queries with EDNS0, we
+            // might also need to fix it to retry without EDNS0.
             // Another thing is that {OPPORTUNISTIC_TLS, Edns::DROP} and {STRICT, Edns::DROP} are
             // commented out since TLS timeout is not configurable.
             // TODO: Uncomment them after TLS timeout is configurable.
-            {OFF,               GETHOSTBYNAME, Edns::ON,      EXPECT_SUCCESS},
-            {OPPORTUNISTIC_UDP, GETHOSTBYNAME, Edns::ON,      EXPECT_SUCCESS},
-            {OPPORTUNISTIC_TLS, GETHOSTBYNAME, Edns::ON,      EXPECT_SUCCESS},
-            {STRICT,            GETHOSTBYNAME, Edns::ON,      EXPECT_SUCCESS},
-            {OFF,               GETHOSTBYNAME, Edns::FORMERR_ON_EDNS, EXPECT_SUCCESS},
-            {OPPORTUNISTIC_UDP, GETHOSTBYNAME, Edns::FORMERR_ON_EDNS, EXPECT_SUCCESS},
-            {OPPORTUNISTIC_TLS, GETHOSTBYNAME, Edns::FORMERR_ON_EDNS, EXPECT_FAILURE},
-            {STRICT,            GETHOSTBYNAME, Edns::FORMERR_ON_EDNS, EXPECT_FAILURE},
-            {OFF,               GETHOSTBYNAME, Edns::DROP,    EXPECT_SUCCESS},
-            {OPPORTUNISTIC_UDP, GETHOSTBYNAME, Edns::DROP,    EXPECT_SUCCESS},
-            //{OPPORTUNISTIC_TLS, GETHOSTBYNAME, Edns::DROP,    EXPECT_FAILURE},
-            //{STRICT,            GETHOSTBYNAME, Edns::DROP,    EXPECT_FAILURE},
-            {OFF,               GETADDRINFO,   Edns::ON,      EXPECT_SUCCESS},
-            {OPPORTUNISTIC_UDP, GETADDRINFO,   Edns::ON,      EXPECT_SUCCESS},
-            {OPPORTUNISTIC_TLS, GETADDRINFO,   Edns::ON,      EXPECT_SUCCESS},
-            {STRICT,            GETADDRINFO,   Edns::ON,      EXPECT_SUCCESS},
-            {OFF,               GETADDRINFO,   Edns::FORMERR_ON_EDNS, EXPECT_SUCCESS},
-            {OPPORTUNISTIC_UDP, GETADDRINFO,   Edns::FORMERR_ON_EDNS, EXPECT_SUCCESS},
-            {OPPORTUNISTIC_TLS, GETADDRINFO,   Edns::FORMERR_ON_EDNS, EXPECT_FAILURE},
-            {STRICT,            GETADDRINFO,   Edns::FORMERR_ON_EDNS, EXPECT_FAILURE},
-            {OFF,               GETADDRINFO,   Edns::DROP,    EXPECT_SUCCESS},
-            {OPPORTUNISTIC_UDP, GETADDRINFO,   Edns::DROP,    EXPECT_SUCCESS},
+            {OFF,                        GETHOSTBYNAME, Edns::ON,      EXPECT_SUCCESS},
+            {OPPORTUNISTIC_UDP,          GETHOSTBYNAME, Edns::ON,      EXPECT_SUCCESS},
+            {OPPORTUNISTIC_FALLBACK_UDP, GETHOSTBYNAME, Edns::ON,      EXPECT_SUCCESS},
+            {OPPORTUNISTIC_TLS,          GETHOSTBYNAME, Edns::ON,      EXPECT_SUCCESS},
+            {STRICT,                     GETHOSTBYNAME, Edns::ON,      EXPECT_SUCCESS},
+            {OFF,                        GETHOSTBYNAME, Edns::FORMERR_ON_EDNS, EXPECT_SUCCESS},
+            {OPPORTUNISTIC_UDP,          GETHOSTBYNAME, Edns::FORMERR_ON_EDNS, EXPECT_SUCCESS},
+            {OPPORTUNISTIC_FALLBACK_UDP, GETHOSTBYNAME, Edns::FORMERR_ON_EDNS, EXPECT_SUCCESS},
+            {OPPORTUNISTIC_TLS,          GETHOSTBYNAME, Edns::FORMERR_ON_EDNS, EXPECT_FAILURE},
+            {STRICT,                     GETHOSTBYNAME, Edns::FORMERR_ON_EDNS, EXPECT_FAILURE},
+            {OFF,                        GETHOSTBYNAME, Edns::DROP,    EXPECT_SUCCESS},
+            {OPPORTUNISTIC_UDP,          GETHOSTBYNAME, Edns::DROP,    EXPECT_SUCCESS},
+
+            // The failure is due to no retry on timeout. Maybe fix it?
+            {OPPORTUNISTIC_FALLBACK_UDP, GETHOSTBYNAME, Edns::DROP,    EXPECT_FAILURE},
+
+            //{OPPORTUNISTIC_TLS,        GETHOSTBYNAME, Edns::DROP,    EXPECT_FAILURE},
+            //{STRICT,                   GETHOSTBYNAME, Edns::DROP,    EXPECT_FAILURE},
+            {OFF,                        GETADDRINFO,   Edns::ON,      EXPECT_SUCCESS},
+            {OPPORTUNISTIC_UDP,          GETADDRINFO,   Edns::ON,      EXPECT_SUCCESS},
+            {OPPORTUNISTIC_FALLBACK_UDP, GETADDRINFO,   Edns::ON,      EXPECT_SUCCESS},
+            {OPPORTUNISTIC_TLS,          GETADDRINFO,   Edns::ON,      EXPECT_SUCCESS},
+            {STRICT,                     GETADDRINFO,   Edns::ON,      EXPECT_SUCCESS},
+            {OFF,                        GETADDRINFO,   Edns::FORMERR_ON_EDNS, EXPECT_SUCCESS},
+            {OPPORTUNISTIC_UDP,          GETADDRINFO,   Edns::FORMERR_ON_EDNS, EXPECT_SUCCESS},
+            {OPPORTUNISTIC_FALLBACK_UDP, GETADDRINFO,   Edns::FORMERR_ON_EDNS, EXPECT_SUCCESS},
+            {OPPORTUNISTIC_TLS,          GETADDRINFO,   Edns::FORMERR_ON_EDNS, EXPECT_FAILURE},
+            {STRICT,                     GETADDRINFO,   Edns::FORMERR_ON_EDNS, EXPECT_FAILURE},
+            {OFF,                        GETADDRINFO,   Edns::DROP,    EXPECT_SUCCESS},
+            {OPPORTUNISTIC_UDP,          GETADDRINFO,   Edns::DROP,    EXPECT_SUCCESS},
+
+            // The failure is due to no retry on timeout. Maybe fix it?
+            {OPPORTUNISTIC_FALLBACK_UDP, GETADDRINFO,   Edns::DROP,    EXPECT_FAILURE},
+
             //{OPPORTUNISTIC_TLS, GETADDRINFO,   Edns::DROP,   EXPECT_FAILURE},
             //{STRICT,            GETADDRINFO,   Edns::DROP,   EXPECT_FAILURE},
     };
@@ -2323,13 +2660,18 @@ TEST_F(ResolverTest, BrokenEdns) {
             ASSERT_TRUE(mDnsClient.SetResolversWithTls(servers, kDefaultSearchDomains,
                                                        kDefaultParams, ""));
             EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), false));
-        } else if (config.mode == OPPORTUNISTIC_TLS) {
+        } else if (config.mode == OPPORTUNISTIC_TLS || config.mode == OPPORTUNISTIC_FALLBACK_UDP) {
             if (!tls.running()) {
                 ASSERT_TRUE(tls.startServer());
             }
             ASSERT_TRUE(mDnsClient.SetResolversWithTls(servers, kDefaultSearchDomains,
                                                        kDefaultParams, ""));
             EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), true));
+
+            if (config.mode == OPPORTUNISTIC_FALLBACK_UDP) {
+                // Force the resolver to fallback to cleartext queries.
+                ASSERT_TRUE(tls.stopServer());
+            }
         } else if (config.mode == STRICT) {
             if (!tls.running()) {
                 ASSERT_TRUE(tls.startServer());
@@ -2372,6 +2714,9 @@ TEST_F(ResolverTest, BrokenEdns) {
 
         tls.clearQueries();
         dns.clearQueries();
+
+        // Clear the setup to force the resolver to validate private DNS servers in every test.
+        ASSERT_TRUE(mDnsClient.SetResolversFromParcel(paramsForCleanup));
     }
 }
 
@@ -3106,6 +3451,7 @@ TEST_F(ResolverTest, GetNameInfo_ReverseDns64QueryFromHostFile) {
     constexpr char listen_addr[] = "::1";
 
     test::DNSResponder dns(listen_addr);
+
     StartDns(dns, {{dns64_name, ns_type::ns_t_aaaa, "64:ff9b::192.0.0.170"}});
     const std::vector<std::string> servers = {listen_addr};
     ASSERT_TRUE(mDnsClient.SetResolversForNetwork(servers));
@@ -3300,6 +3646,7 @@ TEST_F(ResolverTest, PrefixDiscoveryBypassTls) {
     // Setup OPPORTUNISTIC mode and wait for the validation complete.
     ASSERT_TRUE(mDnsClient.SetResolversWithTls(servers, kDefaultSearchDomains, kDefaultParams, ""));
     EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), true));
+    EXPECT_TRUE(tls.waitForQueries(1));
     tls.clearQueries();
 
     // Start NAT64 prefix discovery and wait for it complete.
@@ -3307,8 +3654,8 @@ TEST_F(ResolverTest, PrefixDiscoveryBypassTls) {
     EXPECT_TRUE(WaitForNat64Prefix(EXPECT_FOUND));
 
     // Verify it bypassed TLS even though there's a TLS server available.
-    EXPECT_EQ(0, tls.queries());
-    EXPECT_EQ(1U, GetNumQueries(dns, dns64_name));
+    EXPECT_EQ(0, tls.queries()) << dns.dumpQueries();
+    EXPECT_EQ(1U, GetNumQueries(dns, dns64_name)) << dns.dumpQueries();
 
     // Restart the testing network to reset the cache.
     mDnsClient.TearDown();
@@ -3319,6 +3666,7 @@ TEST_F(ResolverTest, PrefixDiscoveryBypassTls) {
     ASSERT_TRUE(mDnsClient.SetResolversWithTls(servers, kDefaultSearchDomains, kDefaultParams,
                                                kDefaultPrivateDnsHostName));
     EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), true));
+    EXPECT_TRUE(tls.waitForQueries(1));
     tls.clearQueries();
 
     // Start NAT64 prefix discovery and wait for it to complete.
@@ -3326,8 +3674,8 @@ TEST_F(ResolverTest, PrefixDiscoveryBypassTls) {
     EXPECT_TRUE(WaitForNat64Prefix(EXPECT_FOUND));
 
     // Verify it bypassed TLS despite STRICT mode.
-    EXPECT_EQ(0, tls.queries());
-    EXPECT_EQ(1U, GetNumQueries(dns, dns64_name));
+    EXPECT_EQ(0, tls.queries()) << dns.dumpQueries();
+    EXPECT_EQ(1U, GetNumQueries(dns, dns64_name)) << dns.dumpQueries();
 }
 
 namespace {
@@ -3585,8 +3933,9 @@ TEST_F(ResolverTest, ConnectTlsServerTimeout) {
     const ResolverParamsParcel parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
     ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
     EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), true));
-    dns.clearQueries();
+    EXPECT_TRUE(tls.waitForQueries(1));
     tls.clearQueries();
+    dns.clearQueries();
 
     // The server becomes unresponsive to the handshake request.
     tls.setHangOnHandshakeForTesting(true);
@@ -3719,6 +4068,396 @@ TEST_F(ResolverTest, FlushNetworkCache_concurrent) {
     EXPECT_EQ(kHelloExampleComAddrV4, ToString(result));
 }
 
+// TODO: Perhaps to have a boundary conditions test for TCP and UDP.
+TEST_F(ResolverTest, TcpQueryWithOversizePayload) {
+    test::DNSResponder dns;
+    StartDns(dns, {{kHelloExampleCom, ns_type::ns_t_a, kHelloExampleComAddrV4}});
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+
+    int fd = dns_open_proxy();
+    ASSERT_TRUE(fd > 0);
+
+    // Sending DNS query over TCP once the packet sizes exceed 512 bytes.
+    // The raw data is combined with Question section and Additional section
+    // Question section : query "hello.example.com", type A, class IN
+    // Additional section : type OPT (41), Option PADDING, Option Length 546
+    // Padding option which allows DNS clients and servers to artificially
+    // increase the size of a DNS message by a variable number of bytes.
+    // See also RFC7830, section 3
+    const std::string query =
+            "+c0BAAABAAAAAAABBWhlbGxvB2V4YW1wbGUDY29tAAABAAEAACkgAAAAgAACJgAMAiIAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const std::string cmd =
+            "resnsend " + std::to_string(TEST_NETID) + " 0 " /* ResNsendFlags */ + query + '\0';
+    ssize_t rc = TEMP_FAILURE_RETRY(write(fd, cmd.c_str(), cmd.size()));
+    EXPECT_EQ(rc, static_cast<ssize_t>(cmd.size()));
+    expectAnswersValid(fd, AF_INET, kHelloExampleComAddrV4);
+    EXPECT_EQ(1U, GetNumQueriesForProtocol(dns, IPPROTO_TCP, kHelloExampleCom));
+    EXPECT_EQ(0U, GetNumQueriesForProtocol(dns, IPPROTO_UDP, kHelloExampleCom));
+}
+
+TEST_F(ResolverTest, TruncatedRspMode) {
+    constexpr char listen_addr[] = "127.0.0.4";
+    constexpr char listen_addr2[] = "127.0.0.5";
+    constexpr char listen_srv[] = "53";
+
+    test::DNSResponder dns(listen_addr, listen_srv, static_cast<ns_rcode>(-1));
+    test::DNSResponder dns2(listen_addr2, listen_srv, static_cast<ns_rcode>(-1));
+    // dns supports UDP only, dns2 support UDP and TCP
+    dns.setResponseProbability(0.0, IPPROTO_TCP);
+    StartDns(dns, kLargeCnameChainRecords);
+    StartDns(dns2, kLargeCnameChainRecords);
+
+    const struct TestConfig {
+        const std::optional<int32_t> tcMode;
+        const bool ret;
+        const unsigned numQueries;
+        std::string asParameters() const {
+            return StringPrintf("tcMode: %d, ret: %s, numQueries: %u", tcMode.value_or(-1),
+                                ret ? "true" : "false", numQueries);
+        }
+    } testConfigs[]{
+            // clang-format off
+            {std::nullopt,                                      true,  0}, /* mode unset */
+            {aidl::android::net::IDnsResolver::TC_MODE_DEFAULT, true,  0}, /* default mode */
+            {aidl::android::net::IDnsResolver::TC_MODE_UDP_TCP, true,  1}, /* alternative mode */
+            {-666,                                              false, 1}, /* invalid input */
+            // clang-format on
+    };
+
+    for (const auto& config : testConfigs) {
+        SCOPED_TRACE(config.asParameters());
+
+        ResolverParamsParcel parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+        parcel.servers = {listen_addr, listen_addr2};
+        if (config.tcMode) {
+            parcel.experimentalOptions.tcMode = config.tcMode.value();
+        }
+        ASSERT_EQ(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk(), config.ret);
+
+        const addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_DGRAM};
+        ScopedAddrinfo result = safe_getaddrinfo("hello", nullptr, &hints);
+        ASSERT_TRUE(result != nullptr);
+        EXPECT_EQ(ToString(result), kHelloExampleComAddrV4);
+        // TC_MODE_DEFAULT: resolver retries on TCP-only on each name server.
+        // TC_MODE_UDP_TCP: resolver retries on TCP on the same server, falls back to UDP from next.
+        ASSERT_EQ(GetNumQueriesForProtocol(dns, IPPROTO_UDP, kHelloExampleCom), 1U);
+        ASSERT_EQ(GetNumQueriesForProtocol(dns, IPPROTO_TCP, kHelloExampleCom), 1U);
+        ASSERT_EQ(GetNumQueriesForProtocol(dns2, IPPROTO_UDP, kHelloExampleCom), config.numQueries);
+        ASSERT_EQ(GetNumQueriesForProtocol(dns2, IPPROTO_TCP, kHelloExampleCom), 1U);
+
+        dns.clearQueries();
+        dns2.clearQueries();
+        ASSERT_TRUE(mDnsClient.resolvService()->flushNetworkCache(TEST_NETID).isOk());
+    }
+}
+
+TEST_F(ResolverTest, RepeatedSetup_ResolverStatusRemains) {
+    constexpr char unusable_listen_addr[] = "127.0.0.3";
+    constexpr char listen_addr[] = "127.0.0.4";
+    constexpr char hostname[] = "a.hello.query.";
+    const auto repeatedSetResolversFromParcel = [&](const ResolverParamsParcel& parcel) {
+        ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+        ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+        ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+    };
+
+    test::DNSResponder dns(listen_addr);
+    StartDns(dns, {{hostname, ns_type::ns_t_a, "1.2.3.3"}});
+    test::DnsTlsFrontend tls1(listen_addr, "853", listen_addr, "53");
+    ASSERT_TRUE(tls1.startServer());
+
+    // Private DNS off mode.
+    ResolverParamsParcel parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+    parcel.servers = {unusable_listen_addr, listen_addr};
+    parcel.tlsServers.clear();
+    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+    // Send a query.
+    const addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_DGRAM};
+    EXPECT_NE(safe_getaddrinfo(hostname, nullptr, &hints), nullptr);
+
+    // Check the stats as expected.
+    const std::vector<NameserverStats> expectedCleartextDnsStats = {
+            NameserverStats(unusable_listen_addr).setInternalErrors(1),
+            NameserverStats(listen_addr).setSuccesses(1),
+    };
+    EXPECT_TRUE(expectStatsFromGetResolverInfo(expectedCleartextDnsStats));
+    EXPECT_EQ(GetNumQueries(dns, hostname), 1U);
+
+    // The stats is supposed to remain as long as the list of cleartext DNS servers is unchanged.
+    static const struct TestConfig {
+        std::vector<std::string> servers;
+        std::vector<std::string> tlsServers;
+        std::string tlsName;
+    } testConfigs[] = {
+            // Private DNS opportunistic mode.
+            {{listen_addr, unusable_listen_addr}, {listen_addr, unusable_listen_addr}, ""},
+            {{unusable_listen_addr, listen_addr}, {unusable_listen_addr, listen_addr}, ""},
+
+            // Private DNS strict mode.
+            {{listen_addr, unusable_listen_addr}, {"127.0.0.100"}, kDefaultPrivateDnsHostName},
+            {{unusable_listen_addr, listen_addr}, {"127.0.0.100"}, kDefaultPrivateDnsHostName},
+
+            // Private DNS off mode.
+            {{unusable_listen_addr, listen_addr}, {}, ""},
+            {{listen_addr, unusable_listen_addr}, {}, ""},
+    };
+
+    for (const auto& config : testConfigs) {
+        SCOPED_TRACE(fmt::format("testConfig: [{}] [{}] [{}]", fmt::join(config.servers, ","),
+                                 fmt::join(config.tlsServers, ","), config.tlsName));
+        parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+        parcel.servers = config.servers;
+        parcel.tlsServers = config.tlsServers;
+        parcel.tlsName = config.tlsName;
+        repeatedSetResolversFromParcel(parcel);
+        EXPECT_TRUE(expectStatsFromGetResolverInfo(expectedCleartextDnsStats));
+
+        // The stats remains when the list of search domains changes.
+        parcel.domains.push_back("tmp.domains");
+        repeatedSetResolversFromParcel(parcel);
+        EXPECT_TRUE(expectStatsFromGetResolverInfo(expectedCleartextDnsStats));
+
+        // The stats remains when the parameters change (except maxSamples).
+        parcel.sampleValiditySeconds++;
+        parcel.successThreshold++;
+        parcel.minSamples++;
+        parcel.baseTimeoutMsec++;
+        parcel.retryCount++;
+        repeatedSetResolversFromParcel(parcel);
+        EXPECT_TRUE(expectStatsFromGetResolverInfo(expectedCleartextDnsStats));
+    }
+
+    // The cache remains.
+    EXPECT_NE(safe_getaddrinfo(hostname, nullptr, &hints), nullptr);
+    EXPECT_EQ(GetNumQueries(dns, hostname), 1U);
+}
+
+TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
+    const std::string addr1 = getUniqueIPv4Address();  // For a workable DNS server.
+    const std::string addr2 = getUniqueIPv4Address();  // For an unresponsive DNS server.
+    const std::string unusable_addr = getUniqueIPv4Address();
+    const auto waitForPrivateDnsStateUpdated = []() {
+        // A buffer time for the PrivateDnsConfiguration instance to update its map,
+        // mPrivateDnsValidateThreads, which is used for tracking validation threads.
+        // Since there is a time gap between when PrivateDnsConfiguration reports
+        // onPrivateDnsValidationEvent and when PrivateDnsConfiguration updates the map, this is a
+        // workaround to avoid the test starts a subsequent resolver setup during the time gap.
+        // TODO: Report onPrivateDnsValidationEvent after all the relevant updates are complete.
+        // Reference to b/152009023.
+        std::this_thread::sleep_for(20ms);
+    };
+
+    test::DNSResponder dns1(addr1);
+    test::DNSResponder dns2(addr2);
+    StartDns(dns1, {});
+    StartDns(dns2, {});
+    test::DnsTlsFrontend workableTls(addr1, "853", addr1, "53");
+    test::DnsTlsFrontend unresponsiveTls(addr2, "853", addr2, "53");
+    unresponsiveTls.setHangOnHandshakeForTesting(true);
+    ASSERT_TRUE(workableTls.startServer());
+    ASSERT_TRUE(unresponsiveTls.startServer());
+
+    // First setup.
+    ResolverParamsParcel parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+    parcel.servers = {addr1, addr2, unusable_addr};
+    parcel.tlsServers = {addr1, addr2, unusable_addr};
+    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+    // Check the validation results.
+    EXPECT_TRUE(WaitForPrivateDnsValidation(workableTls.listen_address(), true));
+    EXPECT_TRUE(WaitForPrivateDnsValidation(unusable_addr, false));
+    EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), 1);  // The validation is still in progress.
+
+    static const struct TestConfig {
+        std::vector<std::string> tlsServers;
+        std::string tlsName;
+    } testConfigs[] = {
+            {{addr1, addr2, unusable_addr}, ""},
+            {{unusable_addr, addr1, addr2}, ""},
+            {{unusable_addr, addr1, addr2}, kDefaultPrivateDnsHostName},
+            {{addr1, addr2, unusable_addr}, kDefaultPrivateDnsHostName},
+    };
+
+    std::string TlsNameLastTime;
+    for (const auto& config : testConfigs) {
+        SCOPED_TRACE(fmt::format("testConfig: [{}] [{}]", fmt::join(config.tlsServers, ","),
+                                 config.tlsName));
+        parcel.servers = config.tlsServers;
+        parcel.tlsServers = config.tlsServers;
+        parcel.tlsName = config.tlsName;
+        parcel.caCertificate = config.tlsName.empty() ? "" : kCaCert;
+
+        const bool dnsModeChanged = (TlsNameLastTime != config.tlsName);
+
+        waitForPrivateDnsStateUpdated();
+        ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+        for (const auto& serverAddr : parcel.tlsServers) {
+            SCOPED_TRACE(serverAddr);
+            if (serverAddr == workableTls.listen_address()) {
+                if (dnsModeChanged) {
+                    // In despite of the identical IP address, the server is regarded as a different
+                    // server when DnsTlsServer.name is different. The resolver treats it as a
+                    // different object and begins the validation process.
+                    EXPECT_TRUE(WaitForPrivateDnsValidation(serverAddr, true));
+                }
+            } else if (serverAddr == unresponsiveTls.listen_address()) {
+                // No revalidation needed for the server which have been marked as in_progesss.
+            } else {
+                // Must be unusable_addr.
+                // In opportunistic mode, when a validation for a private DNS server fails, the
+                // resolver just marks the server as failed and doesn't re-evaluate it, but the
+                // server can be re-evaluated when setResolverConfiguration() is called.
+                // However, in strict mode, the resolver automatically re-evaluates the server and
+                // marks the server as in_progress until the validation succeeds, so repeated setup
+                // makes no effect.
+                if (dnsModeChanged || config.tlsName.empty() /* not in strict mode */) {
+                    EXPECT_TRUE(WaitForPrivateDnsValidation(serverAddr, false));
+                }
+            }
+        }
+
+        // Repeated setups make no effect in strict mode.
+        waitForPrivateDnsStateUpdated();
+        ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+        if (config.tlsName.empty()) {
+            EXPECT_TRUE(WaitForPrivateDnsValidation(unusable_addr, false));
+        }
+        waitForPrivateDnsStateUpdated();
+        ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+        if (config.tlsName.empty()) {
+            EXPECT_TRUE(WaitForPrivateDnsValidation(unusable_addr, false));
+        }
+
+        EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), 1);
+
+        TlsNameLastTime = config.tlsName;
+    }
+
+    // Check that all the validation results are caught.
+    // Note: it doesn't mean no validation being in progress.
+    EXPECT_FALSE(hasUncaughtPrivateDnsValidation(addr1));
+    EXPECT_FALSE(hasUncaughtPrivateDnsValidation(addr2));
+    EXPECT_FALSE(hasUncaughtPrivateDnsValidation(unusable_addr));
+}
+
+TEST_F(ResolverTest, RepeatedSetup_KeepChangingPrivateDnsServers) {
+    enum TlsServerState { WORKING, UNSUPPORTED, UNRESPONSIVE };
+    const std::string addr1 = getUniqueIPv4Address();
+    const std::string addr2 = getUniqueIPv4Address();
+
+    test::DNSResponder dns1(addr1);
+    test::DNSResponder dns2(addr2);
+    StartDns(dns1, {});
+    StartDns(dns2, {});
+    test::DnsTlsFrontend tls1(addr1, "853", addr1, "53");
+    test::DnsTlsFrontend tls2(addr2, "853", addr2, "53");
+    ASSERT_TRUE(tls1.startServer());
+    ASSERT_TRUE(tls2.startServer());
+
+    static const struct TestConfig {
+        std::string tlsServer;
+        std::string tlsName;
+        bool expectNothingHappenWhenServerUnsupported;
+        bool expectNothingHappenWhenServerUnresponsive;
+        std::string asTestName() const {
+            return fmt::format("{}, {}, {}, {}", tlsServer, tlsName,
+                               expectNothingHappenWhenServerUnsupported,
+                               expectNothingHappenWhenServerUnresponsive);
+        }
+    } testConfigs[] = {
+            {{addr1}, "", false, false},
+            {{addr2}, "", false, false},
+            {{addr1}, "", false, true},
+            {{addr2}, "", false, true},
+            {{addr1}, kDefaultPrivateDnsHostName, false, true},
+            {{addr2}, kDefaultPrivateDnsHostName, false, true},
+            {{addr1}, kDefaultPrivateDnsHostName, true, true},
+            {{addr2}, kDefaultPrivateDnsHostName, true, true},
+
+            // There's no new validation to start because there are already two validation threads
+            // running (one is for addr1, the other is for addr2). This is because the comparator
+            // doesn't compare DnsTlsServer.name. Keep the design as-is until it's known to be
+            // harmful.
+            {{addr1}, "", true, true},
+            {{addr2}, "", true, true},
+            {{addr1}, "", true, true},
+            {{addr2}, "", true, true},
+    };
+
+    for (const auto& serverState : {WORKING, UNSUPPORTED, UNRESPONSIVE}) {
+        int testIndex = 0;
+        for (const auto& config : testConfigs) {
+            SCOPED_TRACE(fmt::format("serverState:{} testIndex:{} testConfig:[{}]", serverState,
+                                     testIndex++, config.asTestName()));
+            auto& tls = (config.tlsServer == addr1) ? tls1 : tls2;
+
+            if (serverState == UNSUPPORTED && tls.running()) ASSERT_TRUE(tls.stopServer());
+            if (serverState != UNSUPPORTED && !tls.running()) ASSERT_TRUE(tls.startServer());
+
+            tls.setHangOnHandshakeForTesting(serverState == UNRESPONSIVE);
+            const int connectCountsBefore = tls.acceptConnectionsCount();
+
+            ResolverParamsParcel parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+            parcel.servers = {config.tlsServer};
+            parcel.tlsServers = {config.tlsServer};
+            parcel.tlsName = config.tlsName;
+            parcel.caCertificate = config.tlsName.empty() ? "" : kCaCert;
+            ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+            if (serverState == WORKING) {
+                EXPECT_TRUE(WaitForPrivateDnsValidation(config.tlsServer, true));
+            } else if (serverState == UNSUPPORTED) {
+                if (config.expectNothingHappenWhenServerUnsupported) {
+                    // It's possible that the resolver hasn't yet started to
+                    // connect. Wait a while.
+                    // TODO: See if we can get rid of the hard waiting time, such as comparing
+                    // the CountDiff across two tests.
+                    std::this_thread::sleep_for(100ms);
+                    EXPECT_EQ(tls.acceptConnectionsCount(), connectCountsBefore);
+                } else {
+                    EXPECT_TRUE(WaitForPrivateDnsValidation(config.tlsServer, false));
+                }
+            } else {
+                // Must be UNRESPONSIVE.
+                // DnsTlsFrontend is the only signal for checking whether or not the resolver starts
+                // another validation when the server is unresponsive.
+                const int expectCountDiff =
+                        config.expectNothingHappenWhenServerUnresponsive ? 0 : 1;
+                if (expectCountDiff == 0) {
+                    // It's possible that the resolver hasn't yet started to
+                    // connect. Wait a while.
+                    std::this_thread::sleep_for(100ms);
+                }
+                const auto condition = [&]() {
+                    return tls.acceptConnectionsCount() == connectCountsBefore + expectCountDiff;
+                };
+                EXPECT_TRUE(PollForCondition(condition));
+            }
+        }
+
+        // Set to off mode to reset the PrivateDnsConfiguration state.
+        ResolverParamsParcel setupOffmode = DnsResponderClient::GetDefaultResolverParamsParcel();
+        setupOffmode.tlsServers.clear();
+        ASSERT_TRUE(mDnsClient.SetResolversFromParcel(setupOffmode));
+    }
+
+    // Check that all the validation results are caught.
+    // Note: it doesn't mean no validation being in progress.
+    EXPECT_FALSE(hasUncaughtPrivateDnsValidation(addr1));
+    EXPECT_FALSE(hasUncaughtPrivateDnsValidation(addr2));
+}
+
 // Parameterized tests.
 // TODO: Merge the existing tests as parameterized test if possible.
 // TODO: Perhaps move parameterized tests to an independent file.
@@ -3726,7 +4465,8 @@ enum class CallType { GETADDRINFO, GETHOSTBYNAME };
 class ResolverParameterizedTest : public ResolverTest,
                                   public testing::WithParamInterface<CallType> {
   protected:
-    void VerifyQueryHelloExampleComV4(const test::DNSResponder& dns, const CallType calltype) {
+    void VerifyQueryHelloExampleComV4(const test::DNSResponder& dns, const CallType calltype,
+                                      const bool verifyNumQueries = true) {
         if (calltype == CallType::GETADDRINFO) {
             const addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_DGRAM};
             ScopedAddrinfo result = safe_getaddrinfo("hello", nullptr, &hints);
@@ -3742,7 +4482,7 @@ class ResolverParameterizedTest : public ResolverTest,
         } else {
             FAIL() << "Unsupported call type: " << static_cast<uint32_t>(calltype);
         }
-        EXPECT_EQ(1U, GetNumQueries(dns, kHelloExampleCom));
+        if (verifyNumQueries) EXPECT_EQ(1U, GetNumQueries(dns, kHelloExampleCom));
     }
 };
 
@@ -3955,4 +4695,17 @@ TEST_P(ResolverParameterizedTest, MessageCompression) {
         // Expect no cache because the TTL of testing responses are 0.
         VerifyQueryHelloExampleComV4(dns, calltype);
     }
+}
+
+TEST_P(ResolverParameterizedTest, TruncatedResponse) {
+    const auto& calltype = GetParam();
+
+    test::DNSResponder dns;
+    StartDns(dns, kLargeCnameChainRecords);
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+
+    // Expect UDP response is truncated. The resolver retries over TCP. See RFC 1035 section 4.2.1.
+    VerifyQueryHelloExampleComV4(dns, calltype, false);
+    EXPECT_EQ(1U, GetNumQueriesForProtocol(dns, IPPROTO_UDP, kHelloExampleCom));
+    EXPECT_EQ(1U, GetNumQueriesForProtocol(dns, IPPROTO_TCP, kHelloExampleCom));
 }

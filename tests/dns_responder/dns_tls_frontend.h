@@ -53,9 +53,12 @@ class DnsTlsFrontend {
     bool running() const { return socket_ != -1; }
     bool startServer();
     bool stopServer();
+
     int queries() const { return queries_; }
     void clearQueries() { queries_ = 0; }
-    bool waitForQueries(int number, int timeoutMs) const;
+    bool waitForQueries(int expected_count) const;
+    int acceptConnectionsCount() const { return accept_connection_count_; }
+
     void set_chain_length(int length) { chain_length_ = length; }
     void setHangOnHandshakeForTesting(bool hangOnHandshake) { hangOnHandshake_ = hangOnHandshake; }
 
@@ -86,6 +89,7 @@ class DnsTlsFrontend {
     // Eventfd used to signal for the handler thread termination.
     android::base::unique_fd event_fd_;
     std::atomic<int> queries_ = 0;
+    std::atomic<int> accept_connection_count_ = 0;
     std::thread handler_thread_ GUARDED_BY(update_mutex_);
     std::mutex update_mutex_;
     int chain_length_ = 1;
