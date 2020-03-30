@@ -23,6 +23,11 @@ aidl_interface {
         "netd_event_listener_interface",
     ],
     backend: {
+        java: {
+            apex_available: [
+                "com.android.bluetooth.updatable",
+            ],
+        },
         ndk: {
             gen_log: true,
         },
@@ -32,6 +37,37 @@ aidl_interface {
         "2",
         "3",
     ],
+}
+
+cc_defaults {
+    name: "resolv_test_defaults",
+    // Note that, static link liblog and libbase is a hard requirement for resolv related tests
+    // because libbase is not compatible between Q and R for general platform build due
+    // to its log revelant functions changing. And most of resolv related tests must be able to run
+    // in Q.
+    static_libs: [
+        "libbase",
+        "liblog",
+    ],
+}
+
+cc_defaults {
+    // This is necessary to have the coverage tests run on cf_x86_phone.
+    // Because the test_suite target is 64 bit and the test infra is running the 64 bit test
+    // suite on cf_x86_phone (32-bit) for coverage.
+    // See b/147785146 for details.
+    // TODO: Remove this target after coverage test switched to 64-bit device.
+    name: "resolv_test_mts_coverage_defaults",
+    test_config_template: ":resolv_test_config_template",
+    compile_multilib: "both",
+    multilib: {
+        lib32: {
+            suffix: "32",
+        },
+        lib64: {
+            suffix: "64",
+        },
+    },
 }
 
 cc_library {
@@ -175,13 +211,21 @@ cc_library_static {
     ],
 }
 
+filegroup {
+    name: "resolv_test_config_template",
+    srcs: [
+        "resolv_test_config_template.xml",
+    ],
+}
+
 // TODO: Move this test to tests/
 cc_test {
     name: "resolv_unit_test",
     test_suites: ["device-tests", "mts"],
     require_root: true,
-    //TODO:  drop root privileges and make it be an real unit test.
-    defaults: ["netd_defaults"],
+    // TODO: Drop root privileges and make it be an real unit test.
+    // TODO: Remove resolv_test_mts_coverage_defaults after mts coverage switched to 64-bit device.
+    defaults: ["netd_defaults", "resolv_test_defaults", "resolv_test_mts_coverage_defaults"],
     srcs: [
         "resolv_cache_unit_test.cpp",
         "resolv_callback_unit_test.cpp",
@@ -193,14 +237,12 @@ cc_test {
     shared_libs: [
         "libcrypto",
         "libbinder_ndk",
-        "liblog",
         "libssl",
     ],
     static_libs: [
         "dnsresolver_aidl_interface-unstable-ndk_platform",
         "netd_event_listener_interface-ndk_platform",
         "libcutils",
-        "libbase",
         "libgmock",
         "libnetd_resolv",
         "libnetd_test_dnsresponder",
@@ -215,5 +257,4 @@ cc_test {
         "server_configurable_flags",
         "stats_proto",
     ],
-    compile_multilib: "first",
 }
