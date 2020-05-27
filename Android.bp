@@ -34,6 +34,7 @@ aidl_interface {
             apex_available: [
                 "com.android.resolv",
             ],
+            min_sdk_version: "29",
         },
     },
     versions: [
@@ -41,6 +42,7 @@ aidl_interface {
         "2",
         "3",
         "4",
+        "5",
     ],
 }
 
@@ -121,13 +123,11 @@ cc_library {
         "dnsresolver_aidl_interface-ndk_platform",
         "libbase",
         "libcutils",
-        "libjsoncpp",
         "libnetdutils",
         "libprotobuf-cpp-lite",
         "libstatslog_resolv",
         "libstatspush_compat",
         "libsysutils",
-        "libutils", // Used by libstatslog_resolv
         "netd_event_listener_interface-ndk_platform",
         "server_configurable_flags",
         "stats_proto",
@@ -173,6 +173,7 @@ cc_library {
         cfi: true,
     },
     apex_available: ["com.android.resolv"],
+    min_sdk_version: "29",
 }
 
 cc_library_static {
@@ -186,6 +187,7 @@ cc_library_static {
         "stats.proto",
     ],
     apex_available: ["com.android.resolv"],
+    min_sdk_version: "29",
 }
 
 genrule {
@@ -218,6 +220,7 @@ cc_library_static {
         "libstatspush_compat",
     ],
     apex_available: ["com.android.resolv"],
+    min_sdk_version: "29",
 }
 
 filegroup {
@@ -262,7 +265,7 @@ cc_test {
         "libcutils",
         "libgmock",
         "libnetd_resolv",
-        "libnetd_test_dnsresponder",
+        "libnetd_test_dnsresponder_ndk",
         "libnetd_test_resolv_utils",
         "libnetdutils",
         "libprotobuf-cpp-lite",
