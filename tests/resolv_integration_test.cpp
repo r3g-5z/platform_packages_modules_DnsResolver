@@ -53,6 +53,7 @@
 #include <numeric>
 #include <thread>
 
+#include <DnsProxydProtocol.h>  // NETID_USE_LOCAL_NAMESERVERS
 #include <aidl/android/net/IDnsResolver.h>
 #include <android/binder_manager.h>
 #include <android/binder_process.h>
@@ -71,9 +72,6 @@
 // Valid VPN netId range is 100 ~ 65535
 constexpr int TEST_VPN_NETID = 65502;
 constexpr int MAXPACKET = (8 * 1024);
-
-// Use maximum reserved appId for applications to avoid conflict with existing uids.
-static const int TEST_UID = 99999;
 
 // Semi-public Bionic hook used by the NDK (frameworks/base/native/android/net.c)
 // Tested here for convenience.
@@ -185,12 +183,21 @@ class ResolverTest : public ::testing::Test {
     static void TearDownTestSuite() { AIBinder_DeathRecipient_delete(sResolvDeathRecipient); }
 
   protected:
-    void SetUp() { mDnsClient.SetUp(); }
+    void SetUp() {
+        mDnsClient.SetUp();
+        sDnsMetricsListener->reset();
+    }
+
     void TearDown() {
         // Ensure the dump works at the end of each test.
         DumpResolverService();
 
         mDnsClient.TearDown();
+    }
+
+    void resetNetwork() {
+        mDnsClient.TearDown();
+        mDnsClient.SetupOemNetwork();
     }
 
     void StartDns(test::DNSResponder& dns, const std::vector<DnsRecord>& records) {
@@ -1693,7 +1700,7 @@ TEST_F(ResolverTest, GetHostByName_TlsFailover) {
     // Wait for query to get counted.
     EXPECT_TRUE(tls1.waitForQueries(2));
     // No new queries should have reached tls2.
-    EXPECT_EQ(1, tls2.queries());
+    EXPECT_TRUE(tls2.waitForQueries(1));
 
     // Stop tls1.  Subsequent queries should attempt to reach tls1, fail, and retry to tls2.
     tls1.stopServer();
@@ -2229,13 +2236,13 @@ TEST_F(ResolverTest, Async_MalformedQuery) {
 
 TEST_F(ResolverTest, Async_CacheFlags) {
     constexpr char listen_addr[] = "127.0.0.4";
-    constexpr char host_name[] = "howdy.example.com.";
-    constexpr char another_host_name[] = "howdy.example2.com.";
+    constexpr char host_name1[] = "howdy.example.com.";
+    constexpr char host_name2[] = "howdy.example2.com.";
+    constexpr char host_name3[] = "howdy.example3.com.";
     const std::vector<DnsRecord> records = {
-            {host_name, ns_type::ns_t_a, "1.2.3.4"},
-            {host_name, ns_type::ns_t_aaaa, "::1.2.3.4"},
-            {another_host_name, ns_type::ns_t_a, "1.2.3.5"},
-            {another_host_name, ns_type::ns_t_aaaa, "::1.2.3.5"},
+            {host_name1, ns_type::ns_t_a, "1.2.3.4"}, {host_name1, ns_type::ns_t_aaaa, "::1.2.3.4"},
+            {host_name2, ns_type::ns_t_a, "1.2.3.5"}, {host_name2, ns_type::ns_t_aaaa, "::1.2.3.5"},
+            {host_name3, ns_type::ns_t_a, "1.2.3.6"}, {host_name3, ns_type::ns_t_aaaa, "::1.2.3.6"},
     };
 
     test::DNSResponder dns(listen_addr);
@@ -2259,17 +2266,28 @@ TEST_F(ResolverTest, Async_CacheFlags) {
     expectAnswersValid(fd1, AF_INET, "1.2.3.4");
 
     // No cache exists, expect 3 queries
-    EXPECT_EQ(3U, GetNumQueries(dns, host_name));
+    EXPECT_EQ(3U, GetNumQueries(dns, host_name1));
 
-    // Re-query and cache
+    // Raise a query with no flags to ensure no cache exists. Also make an cache entry for the
+    // query.
     fd1 = resNetworkQuery(TEST_NETID, "howdy.example.com", ns_c_in, ns_t_a, 0);
 
     EXPECT_TRUE(fd1 != -1);
 
     expectAnswersValid(fd1, AF_INET, "1.2.3.4");
 
-    // Now we have cache, expect 4 queries
-    EXPECT_EQ(4U, GetNumQueries(dns, host_name));
+    // Expect 4 queries because there should be no cache before this query.
+    EXPECT_EQ(4U, GetNumQueries(dns, host_name1));
+
+    // Now we have the cache entry, re-query with ANDROID_RESOLV_NO_CACHE_STORE to ensure
+    // that ANDROID_RESOLV_NO_CACHE_STORE implied ANDROID_RESOLV_NO_CACHE_LOOKUP.
+    fd1 = resNetworkQuery(TEST_NETID, "howdy.example.com", ns_c_in, ns_t_a,
+                          ANDROID_RESOLV_NO_CACHE_STORE);
+    EXPECT_TRUE(fd1 != -1);
+    expectAnswersValid(fd1, AF_INET, "1.2.3.4");
+    // Expect 5 queries because we shouldn't do cache lookup for the query which has
+    // ANDROID_RESOLV_NO_CACHE_STORE.
+    EXPECT_EQ(5U, GetNumQueries(dns, host_name1));
 
     // ANDROID_RESOLV_NO_CACHE_LOOKUP
     fd1 = resNetworkQuery(TEST_NETID, "howdy.example.com", ns_c_in, ns_t_a,
@@ -2283,78 +2301,77 @@ TEST_F(ResolverTest, Async_CacheFlags) {
     expectAnswersValid(fd2, AF_INET, "1.2.3.4");
     expectAnswersValid(fd1, AF_INET, "1.2.3.4");
 
-    // Skip cache, expect 6 queries
-    EXPECT_EQ(6U, GetNumQueries(dns, host_name));
+    // Cache was skipped, expect 2 more queries.
+    EXPECT_EQ(7U, GetNumQueries(dns, host_name1));
 
     // Re-query verify cache works
-    fd1 = resNetworkQuery(TEST_NETID, "howdy.example.com", ns_c_in, ns_t_a,
-                          ANDROID_RESOLV_NO_CACHE_STORE);
+    fd1 = resNetworkQuery(TEST_NETID, "howdy.example.com", ns_c_in, ns_t_a, 0);
     EXPECT_TRUE(fd1 != -1);
     expectAnswersValid(fd1, AF_INET, "1.2.3.4");
 
-    // Cache hits,  expect still 6 queries
-    EXPECT_EQ(6U, GetNumQueries(dns, host_name));
+    // Cache hits,  expect still 7 queries
+    EXPECT_EQ(7U, GetNumQueries(dns, host_name1));
 
     // Start to verify if ANDROID_RESOLV_NO_CACHE_LOOKUP does write response into cache
     dns.clearQueries();
 
-    fd1 = resNetworkQuery(TEST_NETID, "howdy.example.com", ns_c_in, ns_t_aaaa,
+    fd1 = resNetworkQuery(TEST_NETID, "howdy.example2.com", ns_c_in, ns_t_aaaa,
                           ANDROID_RESOLV_NO_CACHE_LOOKUP);
-    fd2 = resNetworkQuery(TEST_NETID, "howdy.example.com", ns_c_in, ns_t_aaaa,
+    fd2 = resNetworkQuery(TEST_NETID, "howdy.example2.com", ns_c_in, ns_t_aaaa,
                           ANDROID_RESOLV_NO_CACHE_LOOKUP);
 
     EXPECT_TRUE(fd1 != -1);
     EXPECT_TRUE(fd2 != -1);
 
-    expectAnswersValid(fd2, AF_INET6, "::1.2.3.4");
-    expectAnswersValid(fd1, AF_INET6, "::1.2.3.4");
+    expectAnswersValid(fd2, AF_INET6, "::1.2.3.5");
+    expectAnswersValid(fd1, AF_INET6, "::1.2.3.5");
 
     // Skip cache, expect 2 queries
-    EXPECT_EQ(2U, GetNumQueries(dns, host_name));
+    EXPECT_EQ(2U, GetNumQueries(dns, host_name2));
 
     // Re-query without flags
-    fd1 = resNetworkQuery(TEST_NETID, "howdy.example.com", ns_c_in, ns_t_aaaa, 0);
-    fd2 = resNetworkQuery(TEST_NETID, "howdy.example.com", ns_c_in, ns_t_aaaa, 0);
+    fd1 = resNetworkQuery(TEST_NETID, "howdy.example2.com", ns_c_in, ns_t_aaaa, 0);
+    fd2 = resNetworkQuery(TEST_NETID, "howdy.example2.com", ns_c_in, ns_t_aaaa, 0);
 
     EXPECT_TRUE(fd1 != -1);
     EXPECT_TRUE(fd2 != -1);
 
-    expectAnswersValid(fd2, AF_INET6, "::1.2.3.4");
-    expectAnswersValid(fd1, AF_INET6, "::1.2.3.4");
+    expectAnswersValid(fd2, AF_INET6, "::1.2.3.5");
+    expectAnswersValid(fd1, AF_INET6, "::1.2.3.5");
 
     // Cache hits, expect still 2 queries
-    EXPECT_EQ(2U, GetNumQueries(dns, host_name));
+    EXPECT_EQ(2U, GetNumQueries(dns, host_name2));
 
     // Test both ANDROID_RESOLV_NO_CACHE_STORE and ANDROID_RESOLV_NO_CACHE_LOOKUP are set
     dns.clearQueries();
 
-    // Make sure that the cache of "howdy.example2.com" exists.
-    fd1 = resNetworkQuery(TEST_NETID, "howdy.example2.com", ns_c_in, ns_t_aaaa, 0);
+    // Make sure that the cache of "howdy.example3.com" exists.
+    fd1 = resNetworkQuery(TEST_NETID, "howdy.example3.com", ns_c_in, ns_t_aaaa, 0);
     EXPECT_TRUE(fd1 != -1);
-    expectAnswersValid(fd1, AF_INET6, "::1.2.3.5");
-    EXPECT_EQ(1U, GetNumQueries(dns, another_host_name));
+    expectAnswersValid(fd1, AF_INET6, "::1.2.3.6");
+    EXPECT_EQ(1U, GetNumQueries(dns, host_name3));
 
     // Re-query with testFlags
     const int testFlag = ANDROID_RESOLV_NO_CACHE_STORE | ANDROID_RESOLV_NO_CACHE_LOOKUP;
-    fd1 = resNetworkQuery(TEST_NETID, "howdy.example2.com", ns_c_in, ns_t_aaaa, testFlag);
+    fd1 = resNetworkQuery(TEST_NETID, "howdy.example3.com", ns_c_in, ns_t_aaaa, testFlag);
     EXPECT_TRUE(fd1 != -1);
-    expectAnswersValid(fd1, AF_INET6, "::1.2.3.5");
+    expectAnswersValid(fd1, AF_INET6, "::1.2.3.6");
     // Expect cache lookup is skipped.
-    EXPECT_EQ(2U, GetNumQueries(dns, another_host_name));
+    EXPECT_EQ(2U, GetNumQueries(dns, host_name3));
 
     // Do another query with testFlags
-    fd1 = resNetworkQuery(TEST_NETID, "howdy.example2.com", ns_c_in, ns_t_a, testFlag);
+    fd1 = resNetworkQuery(TEST_NETID, "howdy.example3.com", ns_c_in, ns_t_a, testFlag);
     EXPECT_TRUE(fd1 != -1);
-    expectAnswersValid(fd1, AF_INET, "1.2.3.5");
+    expectAnswersValid(fd1, AF_INET, "1.2.3.6");
     // Expect cache lookup is skipped.
-    EXPECT_EQ(3U, GetNumQueries(dns, another_host_name));
+    EXPECT_EQ(3U, GetNumQueries(dns, host_name3));
 
     // Re-query with no flags
-    fd1 = resNetworkQuery(TEST_NETID, "howdy.example2.com", ns_c_in, ns_t_a, 0);
+    fd1 = resNetworkQuery(TEST_NETID, "howdy.example3.com", ns_c_in, ns_t_a, 0);
     EXPECT_TRUE(fd1 != -1);
-    expectAnswersValid(fd1, AF_INET, "1.2.3.5");
+    expectAnswersValid(fd1, AF_INET, "1.2.3.6");
     // Expect no cache hit because cache storing is also skipped in previous query.
-    EXPECT_EQ(4U, GetNumQueries(dns, another_host_name));
+    EXPECT_EQ(4U, GetNumQueries(dns, host_name3));
 }
 
 TEST_F(ResolverTest, Async_NoCacheStoreFlagDoesNotRefreshStaleCacheEntry) {
@@ -3678,6 +3695,143 @@ TEST_F(ResolverTest, PrefixDiscoveryBypassTls) {
     EXPECT_EQ(1U, GetNumQueries(dns, dns64_name)) << dns.dumpQueries();
 }
 
+TEST_F(ResolverTest, SetAndClearNat64Prefix) {
+    constexpr char host_name[] = "v4.example.com.";
+    constexpr char listen_addr[] = "::1";
+    const std::vector<DnsRecord> records = {
+            {host_name, ns_type::ns_t_a, "1.2.3.4"},
+    };
+    const std::string kNat64Prefix1 = "64:ff9b::/96";
+    const std::string kNat64Prefix2 = "2001:db8:6464::/96";
+
+    test::DNSResponder dns(listen_addr);
+    StartDns(dns, records);
+    const std::vector<std::string> servers = {listen_addr};
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork(servers));
+
+    auto resolvService = mDnsClient.resolvService();
+    addrinfo hints = {.ai_family = AF_INET6};
+
+    // No NAT64 prefix, no AAAA record.
+    ScopedAddrinfo result = safe_getaddrinfo("v4.example.com", nullptr, &hints);
+    ASSERT_TRUE(result == nullptr);
+
+    // Set the prefix, and expect to get a synthesized AAAA record.
+    EXPECT_TRUE(resolvService->setPrefix64(TEST_NETID, kNat64Prefix2).isOk());
+    result = safe_getaddrinfo("v4.example.com", nullptr, &hints);
+    ASSERT_FALSE(result == nullptr);
+    EXPECT_EQ("2001:db8:6464::102:304", ToString(result));
+
+    // Update the prefix, expect to see AAAA records from the new prefix.
+    EXPECT_TRUE(resolvService->setPrefix64(TEST_NETID, kNat64Prefix1).isOk());
+    result = safe_getaddrinfo("v4.example.com", nullptr, &hints);
+    ASSERT_FALSE(result == nullptr);
+    EXPECT_EQ("64:ff9b::102:304", ToString(result));
+
+    // Non-/96 prefixes are ignored.
+    auto status = resolvService->setPrefix64(TEST_NETID, "64:ff9b::/64");
+    EXPECT_FALSE(status.isOk());
+    EXPECT_EQ(EX_SERVICE_SPECIFIC, status.getExceptionCode());
+    EXPECT_EQ(EINVAL, status.getServiceSpecificError());
+
+    // Invalid prefixes are ignored.
+    status = resolvService->setPrefix64(TEST_NETID, "192.0.2.0/24");
+    EXPECT_FALSE(status.isOk());
+    EXPECT_EQ(EX_SERVICE_SPECIFIC, status.getExceptionCode());
+    EXPECT_EQ(EINVAL, status.getServiceSpecificError());
+
+    status = resolvService->setPrefix64(TEST_NETID, "192.0.2.1");
+    EXPECT_FALSE(status.isOk());
+    EXPECT_EQ(EX_SERVICE_SPECIFIC, status.getExceptionCode());
+    EXPECT_EQ(EINVAL, status.getServiceSpecificError());
+
+    status = resolvService->setPrefix64(TEST_NETID, "hello");
+    EXPECT_FALSE(status.isOk());
+    EXPECT_EQ(EX_SERVICE_SPECIFIC, status.getExceptionCode());
+    EXPECT_EQ(EINVAL, status.getServiceSpecificError());
+
+    // DNS64 synthesis is still working.
+    result = safe_getaddrinfo("v4.example.com", nullptr, &hints);
+    ASSERT_FALSE(result == nullptr);
+    EXPECT_EQ("64:ff9b::102:304", ToString(result));
+
+    // Clear the prefix. No AAAA records any more.
+    EXPECT_TRUE(resolvService->setPrefix64(TEST_NETID, "").isOk());
+    result = safe_getaddrinfo("v4.example.com", nullptr, &hints);
+    EXPECT_TRUE(result == nullptr);
+
+    // Calling startPrefix64Discovery clears the prefix.
+    EXPECT_TRUE(resolvService->setPrefix64(TEST_NETID, kNat64Prefix1).isOk());
+    result = safe_getaddrinfo("v4.example.com", nullptr, &hints);
+    ASSERT_FALSE(result == nullptr);
+    EXPECT_EQ("64:ff9b::102:304", ToString(result));
+
+    EXPECT_TRUE(resolvService->startPrefix64Discovery(TEST_NETID).isOk());
+    result = safe_getaddrinfo("v4.example.com", nullptr, &hints);
+    ASSERT_TRUE(result == nullptr);
+
+    // setPrefix64 fails if prefix discovery is started, even if no prefix is yet discovered...
+    status = resolvService->setPrefix64(TEST_NETID, kNat64Prefix1);
+    EXPECT_FALSE(status.isOk());
+    EXPECT_EQ(EX_SERVICE_SPECIFIC, status.getExceptionCode());
+    EXPECT_EQ(EEXIST, status.getServiceSpecificError());
+
+    // .. and clearing the prefix also has no effect.
+    status = resolvService->setPrefix64(TEST_NETID, "");
+    EXPECT_FALSE(status.isOk());
+    EXPECT_EQ(EX_SERVICE_SPECIFIC, status.getExceptionCode());
+    EXPECT_EQ(ENOENT, status.getServiceSpecificError());
+
+    // setPrefix64 succeeds again when prefix discovery is stopped.
+    EXPECT_TRUE(resolvService->stopPrefix64Discovery(TEST_NETID).isOk());
+    EXPECT_TRUE(resolvService->setPrefix64(TEST_NETID, kNat64Prefix1).isOk());
+    result = safe_getaddrinfo("v4.example.com", nullptr, &hints);
+    ASSERT_FALSE(result == nullptr);
+    EXPECT_EQ("64:ff9b::102:304", ToString(result));
+
+    // Calling stopPrefix64Discovery clears the prefix.
+    EXPECT_TRUE(resolvService->stopPrefix64Discovery(TEST_NETID).isOk());
+    result = safe_getaddrinfo("v4.example.com", nullptr, &hints);
+    ASSERT_TRUE(result == nullptr);
+
+    // Set up NAT64 prefix discovery.
+    constexpr char dns64_name[] = "ipv4only.arpa.";
+    const std::vector<DnsRecord> newRecords = {
+            {host_name, ns_type::ns_t_a, "1.2.3.4"},
+            {dns64_name, ns_type::ns_t_aaaa, "64:ff9b::192.0.0.170"},
+    };
+    dns.stopServer();
+    StartDns(dns, newRecords);
+
+    EXPECT_TRUE(resolvService->startPrefix64Discovery(TEST_NETID).isOk());
+    EXPECT_TRUE(WaitForNat64Prefix(EXPECT_FOUND));
+    result = safe_getaddrinfo("v4.example.com", nullptr, &hints);
+    ASSERT_FALSE(result == nullptr);
+    EXPECT_EQ("64:ff9b::102:304", ToString(result));
+
+    // setPrefix64 fails if NAT64 prefix discovery has succeeded, and the discovered prefix
+    // continues to be used.
+    status = resolvService->setPrefix64(TEST_NETID, kNat64Prefix2);
+    EXPECT_FALSE(status.isOk());
+    EXPECT_EQ(EX_SERVICE_SPECIFIC, status.getExceptionCode());
+    EXPECT_EQ(EEXIST, status.getServiceSpecificError());
+
+    // Clearing the prefix also has no effect if discovery is started.
+    status = resolvService->setPrefix64(TEST_NETID, "");
+    EXPECT_FALSE(status.isOk());
+    EXPECT_EQ(EX_SERVICE_SPECIFIC, status.getExceptionCode());
+    EXPECT_EQ(ENOENT, status.getServiceSpecificError());
+
+    result = safe_getaddrinfo("v4.example.com", nullptr, &hints);
+    ASSERT_FALSE(result == nullptr);
+    EXPECT_EQ("64:ff9b::102:304", ToString(result));
+
+    EXPECT_TRUE(resolvService->stopPrefix64Discovery(TEST_NETID).isOk());
+    EXPECT_TRUE(WaitForNat64Prefix(EXPECT_NOT_FOUND));
+
+    EXPECT_EQ(0, sDnsMetricsListener->getUnexpectedNat64PrefixUpdates());
+}
+
 namespace {
 
 class ScopedSetNetworkForProcess {
@@ -3847,24 +4001,7 @@ TEST_F(ResolverTest, BlockDnsQueryWithUidRule) {
     dns1.clearQueries();
     dns2.clearQueries();
 
-    // Add drop rule for TEST_UID. Also enable the standby chain because it might not be enabled.
-    // Unfortunately we cannot use FIREWALL_CHAIN_NONE, or custom iptables rules, for this purpose
-    // because netd calls fchown() on the DNS query sockets, and "iptables -m owner" matches the
-    // UID of the socket creator, not the UID set by fchown().
-    //
-    // TODO: migrate FIREWALL_CHAIN_NONE to eBPF as well.
-    EXPECT_TRUE(netdService->firewallEnableChildChain(INetd::FIREWALL_CHAIN_STANDBY, true).isOk());
-    EXPECT_TRUE(netdService
-                        ->firewallSetUidRule(INetd::FIREWALL_CHAIN_STANDBY, TEST_UID,
-                                             INetd::FIREWALL_RULE_DENY)
-                        .isOk());
-
-    // Save uid
-    int suid = getuid();
-
-    // Switch to TEST_UID
-    EXPECT_TRUE(seteuid(TEST_UID) == 0);
-
+    ScopeBlockedUIDRule scopeBlockUidRule(netdService, TEST_UID);
     // Dns Query
     int fd1 = resNetworkQuery(TEST_NETID, host_name, ns_c_in, ns_t_a, 0);
     int fd2 = resNetworkQuery(TEST_NETID, host_name, ns_c_in, ns_t_aaaa, 0);
@@ -3879,16 +4016,6 @@ TEST_F(ResolverTest, BlockDnsQueryWithUidRule) {
     memset(buf, 0, MAXPACKET);
     res = getAsyncResponse(fd1, &rcode, buf, MAXPACKET);
     EXPECT_EQ(-ECONNREFUSED, res);
-
-    // Restore uid
-    EXPECT_TRUE(seteuid(suid) == 0);
-
-    // Remove drop rule for TEST_UID, and disable the standby chain.
-    EXPECT_TRUE(netdService
-                        ->firewallSetUidRule(INetd::FIREWALL_CHAIN_STANDBY, TEST_UID,
-                                             INetd::FIREWALL_RULE_ALLOW)
-                        .isOk());
-    EXPECT_TRUE(netdService->firewallEnableChildChain(INetd::FIREWALL_CHAIN_STANDBY, false).isOk());
 }
 
 namespace {
@@ -3963,7 +4090,7 @@ TEST_F(ResolverTest, ConnectTlsServerTimeout) {
     std::tie(result, timeTakenMs) = safe_getaddrinfo_time_taken(hostname2, nullptr, hints);
 
     EXPECT_NE(nullptr, result);
-    EXPECT_EQ(1, tls.queries());
+    EXPECT_TRUE(tls.waitForQueries(1));
     EXPECT_EQ(1U, GetNumQueries(dns, hostname2));
     EXPECT_EQ(records.at(1).addr, ToString(result));
 
@@ -4714,4 +4841,163 @@ TEST_P(ResolverParameterizedTest, TruncatedResponse) {
     VerifyQueryHelloExampleComV4(dns, calltype, false);
     EXPECT_EQ(1U, GetNumQueriesForProtocol(dns, IPPROTO_UDP, kHelloExampleCom));
     EXPECT_EQ(1U, GetNumQueriesForProtocol(dns, IPPROTO_TCP, kHelloExampleCom));
+}
+
+TEST_F(ResolverTest, KeepListeningUDP) {
+    constexpr char listen_addr1[] = "127.0.0.4";
+    constexpr char listen_addr2[] = "127.0.0.5";
+    constexpr char host_name[] = "howdy.example.com.";
+    const std::vector<DnsRecord> records = {
+            {host_name, ns_type::ns_t_aaaa, "::1.2.3.4"},
+    };
+    const std::vector<int> params = {300, 25, 8, 8, 1000 /* BASE_TIMEOUT_MSEC */,
+                                     1 /* retry count */};
+    const int delayTimeMs = 1500;
+
+    test::DNSResponder neverRespondDns(listen_addr2, "53", static_cast<ns_rcode>(-1));
+    neverRespondDns.setResponseProbability(0.0);
+    StartDns(neverRespondDns, records);
+    ScopedSystemProperties scopedSystemProperties(
+            "persist.device_config.netd_native.keep_listening_udp", "1");
+    // Re-setup test network to make experiment flag take effect.
+    resetNetwork();
+
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork({listen_addr1, listen_addr2},
+                                                  kDefaultSearchDomains, params));
+    // There are 2 DNS servers for this test.
+    // |delayedDns| will be blocked for |delayTimeMs|, then start to respond to requests.
+    // |neverRespondDns| will never respond.
+    // In the first try, resolver will send query to |delayedDns| but get timeout error
+    // because |delayTimeMs| > DNS timeout.
+    // Then it's the second try, resolver will send query to |neverRespondDns| and
+    // listen on both servers. Resolver will receive the answer coming from |delayedDns|.
+
+    test::DNSResponder delayedDns(listen_addr1);
+    delayedDns.setResponseDelayMs(delayTimeMs);
+    StartDns(delayedDns, records);
+
+    // Specify hints to ensure resolver doing query only 1 round.
+    const addrinfo hints = {.ai_family = AF_INET6, .ai_socktype = SOCK_DGRAM};
+    ScopedAddrinfo result = safe_getaddrinfo(host_name, nullptr, &hints);
+    EXPECT_TRUE(result != nullptr);
+
+    std::string result_str = ToString(result);
+    EXPECT_TRUE(result_str == "::1.2.3.4") << ", result_str='" << result_str << "'";
+}
+
+TEST_F(ResolverTest, GetAddrInfoParallelLookupTimeout) {
+    constexpr char listen_addr[] = "127.0.0.4";
+    constexpr char host_name[] = "howdy.example.com.";
+    constexpr int TIMING_TOLERANCE_MS = 200;
+    constexpr int DNS_TIMEOUT_MS = 1000;
+    const std::vector<DnsRecord> records = {
+            {host_name, ns_type::ns_t_a, "1.2.3.4"},
+            {host_name, ns_type::ns_t_aaaa, "::1.2.3.4"},
+    };
+    const std::vector<int> params = {300, 25, 8, 8, DNS_TIMEOUT_MS /* BASE_TIMEOUT_MSEC */,
+                                     1 /* retry count */};
+    test::DNSResponder neverRespondDns(listen_addr, "53", static_cast<ns_rcode>(-1));
+    neverRespondDns.setResponseProbability(0.0);
+    StartDns(neverRespondDns, records);
+    ScopedSystemProperties scopedSystemProperties(
+            "persist.device_config.netd_native.parallel_lookup", "1");
+    // The default value of parallel_lookup_sleep_time should be very small
+    // that we can ignore in this test case.
+    // Re-setup test network to make experiment flag take effect.
+    resetNetwork();
+
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork({listen_addr}, kDefaultSearchDomains, params));
+    neverRespondDns.clearQueries();
+
+    // Use a never respond DNS server to verify if the A/AAAA queries are sent in parallel.
+    // The resolver parameters are set to timeout 1s and retry 1 times.
+    // So we expect the safe_getaddrinfo_time_taken() might take ~1s to
+    // return when parallel lookup is enabled. And the DNS server should receive 2 queries.
+    const addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM};
+    auto [result, timeTakenMs] = safe_getaddrinfo_time_taken(host_name, nullptr, hints);
+
+    EXPECT_TRUE(result == nullptr);
+    EXPECT_NEAR(DNS_TIMEOUT_MS, timeTakenMs, TIMING_TOLERANCE_MS)
+            << "took time should approximate equal timeout";
+    EXPECT_EQ(2U, GetNumQueries(neverRespondDns, host_name));
+}
+
+TEST_F(ResolverTest, GetAddrInfoParallelLookupSleepTime) {
+    constexpr char listen_addr[] = "127.0.0.4";
+    constexpr int TIMING_TOLERANCE_MS = 200;
+    const std::vector<DnsRecord> records = {
+            {kHelloExampleCom, ns_type::ns_t_a, kHelloExampleComAddrV4},
+            {kHelloExampleCom, ns_type::ns_t_aaaa, kHelloExampleComAddrV6},
+    };
+    const std::vector<int> params = {300, 25, 8, 8, 1000 /* BASE_TIMEOUT_MSEC */,
+                                     1 /* retry count */};
+    test::DNSResponder dns(listen_addr);
+    StartDns(dns, records);
+    ScopedSystemProperties scopedSystemProperties1(
+            "persist.device_config.netd_native.parallel_lookup", "1");
+    constexpr int PARALLEL_LOOKUP_SLEEP_TIME_MS = 500;
+    ScopedSystemProperties scopedSystemProperties2(
+            "persist.device_config.netd_native.parallel_lookup_sleep_time",
+            std::to_string(PARALLEL_LOOKUP_SLEEP_TIME_MS));
+    // Re-setup test network to make experiment flag take effect.
+    resetNetwork();
+
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork({listen_addr}, kDefaultSearchDomains, params));
+    dns.clearQueries();
+
+    // Expect the safe_getaddrinfo_time_taken() might take ~500ms to return because we set
+    // parallel_lookup_sleep_time to 500ms.
+    const addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM};
+    auto [result, timeTakenMs] = safe_getaddrinfo_time_taken(kHelloExampleCom, nullptr, hints);
+
+    EXPECT_NE(nullptr, result);
+    EXPECT_THAT(ToStrings(result), testing::UnorderedElementsAreArray(
+                                           {kHelloExampleComAddrV4, kHelloExampleComAddrV6}));
+    EXPECT_NEAR(PARALLEL_LOOKUP_SLEEP_TIME_MS, timeTakenMs, TIMING_TOLERANCE_MS)
+            << "took time should approximate equal timeout";
+    EXPECT_EQ(2U, GetNumQueries(dns, kHelloExampleCom));
+
+    // Expect the PARALLEL_LOOKUP_SLEEP_TIME_MS won't affect the query under cache hit case.
+    dns.clearQueries();
+    std::tie(result, timeTakenMs) = safe_getaddrinfo_time_taken(kHelloExampleCom, nullptr, hints);
+    EXPECT_NE(nullptr, result);
+    EXPECT_THAT(ToStrings(result), testing::UnorderedElementsAreArray(
+                                           {kHelloExampleComAddrV4, kHelloExampleComAddrV6}));
+    EXPECT_GT(PARALLEL_LOOKUP_SLEEP_TIME_MS, timeTakenMs);
+    EXPECT_EQ(0U, GetNumQueries(dns, kHelloExampleCom));
+}
+
+TEST_F(ResolverTest, BlockDnsQueryUidDoesNotLeadToBadServer) {
+    // This test relies on blocking traffic on loopback, which xt_qtaguid does not do.
+    // See aosp/358413 and b/34444781 for why.
+    SKIP_IF_BPF_NOT_SUPPORTED;
+
+    constexpr char listen_addr1[] = "127.0.0.4";
+    constexpr char listen_addr2[] = "::1";
+    test::DNSResponder dns1(listen_addr1);
+    test::DNSResponder dns2(listen_addr2);
+    StartDns(dns1, {});
+    StartDns(dns2, {});
+
+    std::vector<std::string> servers = {listen_addr1, listen_addr2};
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork(servers));
+    dns1.clearQueries();
+    dns2.clearQueries();
+    {
+        ScopeBlockedUIDRule scopeBlockUidRule(mDnsClient.netdService(), TEST_UID);
+        // Start querying ten times.
+        for (int i = 0; i < 10; i++) {
+            std::string hostName = fmt::format("blocked{}.com", i);
+            const addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_DGRAM};
+            EXPECT_EQ(safe_getaddrinfo(hostName.c_str(), nullptr, &hints), nullptr);
+        }
+    }
+    // Since all query packets are blocked, we should not see any stats of them.
+    const std::vector<NameserverStats> expectedEmptyDnsStats = {
+            NameserverStats(listen_addr1),
+            NameserverStats(listen_addr2),
+    };
+    expectStatsFromGetResolverInfo(expectedEmptyDnsStats);
+    EXPECT_EQ(dns1.queries().size(), 0U);
+    EXPECT_EQ(dns2.queries().size(), 0U);
 }

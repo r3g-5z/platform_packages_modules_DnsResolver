@@ -30,6 +30,7 @@
 #include <private/android_filesystem_config.h>  // AID_SYSTEM
 
 #include "DnsResolver.h"
+#include "Experiments.h"
 #include "NetdPermissions.h"  // PERM_*
 #include "ResolverEventReporter.h"
 #include "resolv_cache.h"
@@ -38,6 +39,7 @@ using aidl::android::net::ResolverParamsParcel;
 using android::base::Join;
 using android::base::StringPrintf;
 using android::netdutils::DumpWriter;
+using android::netdutils::IPPrefix;
 
 namespace android {
 namespace net {
@@ -115,7 +117,7 @@ binder_status_t DnsResolverService::dump(int fd, const char** args, uint32_t num
         gDnsResolv->resolverCtrl.dump(dw, netId);
         dw.blankline();
     }
-
+    Experiments::getInstance()->dump(dw);
     return STATUS_OK;
 }
 
@@ -239,6 +241,21 @@ binder_status_t DnsResolverService::dump(int fd, const char** args, uint32_t num
     return statusFromErrcode(res);
 }
 
+::ndk::ScopedAStatus DnsResolverService::setPrefix64(int netId, const std::string& stringPrefix) {
+    ENFORCE_NETWORK_STACK_PERMISSIONS();
+
+    if (stringPrefix.empty()) {
+        return statusFromErrcode(gDnsResolv->resolverCtrl.clearPrefix64(netId));
+    }
+
+    IPPrefix prefix;
+    if (!IPPrefix::forString(stringPrefix, &prefix)) {
+        return statusFromErrcode(-EINVAL);
+    }
+
+    return statusFromErrcode(gDnsResolv->resolverCtrl.setPrefix64(netId, prefix));
+}
+
 ::ndk::ScopedAStatus DnsResolverService::setLogSeverity(int32_t logSeverity) {
     ENFORCE_NETWORK_STACK_PERMISSIONS();
 
@@ -252,7 +269,7 @@ binder_status_t DnsResolverService::dump(int fd, const char** args, uint32_t num
     ENFORCE_NETWORK_STACK_PERMISSIONS();
 
     gDnsResolv->resolverCtrl.destroyNetworkCache(netId);
-
+    Experiments::getInstance()->update();
     return ::ndk::ScopedAStatus(AStatus_newOk());
 }
 
@@ -261,7 +278,7 @@ binder_status_t DnsResolverService::dump(int fd, const char** args, uint32_t num
     ENFORCE_NETWORK_STACK_PERMISSIONS();
 
     int res = gDnsResolv->resolverCtrl.createNetworkCache(netId);
-
+    Experiments::getInstance()->update();
     return statusFromErrcode(res);
 }
 

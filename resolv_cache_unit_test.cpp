@@ -22,7 +22,6 @@
 #include <ctime>
 #include <thread>
 
-#include <aidl/android/net/IDnsResolver.h>
 #include <android-base/logging.h>
 #include <android-base/stringprintf.h>
 #include <android/multinetwork.h>
@@ -39,7 +38,6 @@
 
 using namespace std::chrono_literals;
 
-using aidl::android::net::IDnsResolver;
 using android::netdutils::IPSockAddr;
 
 constexpr int TEST_NETID = 30;
@@ -106,9 +104,20 @@ time_t currentTime() {
     return std::time(nullptr);
 }
 
-// Comparison for res_stats. Simply check the count in the cache test.
+// Comparison for res_sample.
+bool operator==(const res_sample& a, const res_sample& b) {
+    return std::tie(a.at, a.rtt, a.rcode) == std::tie(b.at, b.rtt, b.rcode);
+}
+
+// Comparison for res_stats.
 bool operator==(const res_stats& a, const res_stats& b) {
-    return std::tie(a.sample_count, a.sample_next) == std::tie(b.sample_count, b.sample_next);
+    if (std::tie(a.sample_count, a.sample_next) != std::tie(b.sample_count, b.sample_next)) {
+        return false;
+    }
+    for (int i = 0; i < a.sample_count; i++) {
+        if (a.samples[i] != b.samples[i]) return false;
+    }
+    return true;
 }
 
 // Comparison for res_params.
@@ -355,7 +364,7 @@ TEST_F(ResolvCacheTest, CacheLookup_CacheFlags) {
     EXPECT_TRUE(cacheLookup(RESOLV_CACHE_NOTFOUND, TEST_NETID, ce, ANDROID_RESOLV_NO_CACHE_LOOKUP));
 
     // Now no-cache-store has no effect if a same entry is existent in the cache.
-    EXPECT_TRUE(cacheLookup(RESOLV_CACHE_FOUND, TEST_NETID, ce, ANDROID_RESOLV_NO_CACHE_STORE));
+    EXPECT_TRUE(cacheLookup(RESOLV_CACHE_SKIP, TEST_NETID, ce, ANDROID_RESOLV_NO_CACHE_STORE));
 
     // Skip the cache lookup again regardless of a same entry being already in the cache.
     EXPECT_TRUE(cacheLookup(RESOLV_CACHE_SKIP, TEST_NETID, ce,
@@ -839,55 +848,62 @@ TEST_F(ResolvCacheTest, GetHostByAddrFromCache) {
     EXPECT_STREQ(answer, domain_name);
 }
 
-TEST_F(ResolvCacheTest, GetNetworkTypesForNet) {
+TEST_F(ResolvCacheTest, GetResolverStats) {
+    const res_sample sample1 = {.at = time(nullptr), .rtt = 100, .rcode = ns_r_noerror};
+    const res_sample sample2 = {.at = time(nullptr), .rtt = 200, .rcode = ns_r_noerror};
+    const res_sample sample3 = {.at = time(nullptr), .rtt = 300, .rcode = ns_r_noerror};
+    const res_stats expectedStats[MAXNS] = {
+            {{sample1}, 1 /*sample_count*/, 1 /*sample_next*/},
+            {{sample2}, 1, 1},
+            {{sample3}, 1, 1},
+    };
+    std::vector<IPSockAddr> nameserverSockAddrs = {
+            IPSockAddr::toIPSockAddr("127.0.0.1", DNS_PORT),
+            IPSockAddr::toIPSockAddr("::127.0.0.2", DNS_PORT),
+            IPSockAddr::toIPSockAddr("fe80::3", DNS_PORT),
+    };
     const SetupParams setup = {
             .servers = {"127.0.0.1", "::127.0.0.2", "fe80::3"},
             .domains = {"domain1.com", "domain2.com"},
             .params = kParams,
-            .transportTypes = {IDnsResolver::TRANSPORT_WIFI, IDnsResolver::TRANSPORT_VPN}};
+    };
     EXPECT_EQ(0, cacheCreate(TEST_NETID));
     EXPECT_EQ(0, cacheSetupResolver(TEST_NETID, setup));
-    EXPECT_EQ(android::net::NT_WIFI_VPN, resolv_get_network_types_for_net(TEST_NETID));
-}
+    int revision_id = 1;
+    cacheAddStats(TEST_NETID, revision_id, nameserverSockAddrs[0], sample1,
+                  setup.params.max_samples);
+    cacheAddStats(TEST_NETID, revision_id, nameserverSockAddrs[1], sample2,
+                  setup.params.max_samples);
+    cacheAddStats(TEST_NETID, revision_id, nameserverSockAddrs[2], sample3,
+                  setup.params.max_samples);
 
-TEST_F(ResolvCacheTest, ConvertTransportsToNetworkType) {
-    static const struct TestConfig {
-        int32_t networkType;
-        std::vector<int32_t> transportTypes;
-    } testConfigs[] = {
-            {android::net::NT_CELLULAR, {IDnsResolver::TRANSPORT_CELLULAR}},
-            {android::net::NT_WIFI, {IDnsResolver::TRANSPORT_WIFI}},
-            {android::net::NT_BLUETOOTH, {IDnsResolver::TRANSPORT_BLUETOOTH}},
-            {android::net::NT_ETHERNET, {IDnsResolver::TRANSPORT_ETHERNET}},
-            {android::net::NT_VPN, {IDnsResolver::TRANSPORT_VPN}},
-            {android::net::NT_WIFI_AWARE, {IDnsResolver::TRANSPORT_WIFI_AWARE}},
-            {android::net::NT_LOWPAN, {IDnsResolver::TRANSPORT_LOWPAN}},
-            {android::net::NT_CELLULAR_VPN,
-             {IDnsResolver::TRANSPORT_CELLULAR, IDnsResolver::TRANSPORT_VPN}},
-            {android::net::NT_CELLULAR_VPN,
-             {IDnsResolver::TRANSPORT_VPN, IDnsResolver::TRANSPORT_CELLULAR}},
-            {android::net::NT_WIFI_VPN,
-             {IDnsResolver::TRANSPORT_WIFI, IDnsResolver::TRANSPORT_VPN}},
-            {android::net::NT_WIFI_VPN,
-             {IDnsResolver::TRANSPORT_VPN, IDnsResolver::TRANSPORT_WIFI}},
-            {android::net::NT_BLUETOOTH_VPN,
-             {IDnsResolver::TRANSPORT_BLUETOOTH, IDnsResolver::TRANSPORT_VPN}},
-            {android::net::NT_BLUETOOTH_VPN,
-             {IDnsResolver::TRANSPORT_VPN, IDnsResolver::TRANSPORT_BLUETOOTH}},
-            {android::net::NT_ETHERNET_VPN,
-             {IDnsResolver::TRANSPORT_ETHERNET, IDnsResolver::TRANSPORT_VPN}},
-            {android::net::NT_ETHERNET_VPN,
-             {IDnsResolver::TRANSPORT_VPN, IDnsResolver::TRANSPORT_ETHERNET}},
-            {android::net::NT_UNKNOWN, {IDnsResolver::TRANSPORT_VPN, IDnsResolver::TRANSPORT_VPN}},
-            {android::net::NT_UNKNOWN,
-             {IDnsResolver::TRANSPORT_WIFI, IDnsResolver::TRANSPORT_LOWPAN}},
-            {android::net::NT_UNKNOWN, {}},
-            {android::net::NT_UNKNOWN,
-             {IDnsResolver::TRANSPORT_CELLULAR, IDnsResolver::TRANSPORT_WIFI,
-              IDnsResolver::TRANSPORT_VPN}},
+    res_stats cacheStats[MAXNS]{};
+    res_params params;
+    EXPECT_EQ(resolv_cache_get_resolver_stats(TEST_NETID, &params, cacheStats, nameserverSockAddrs),
+              revision_id);
+    EXPECT_TRUE(params == kParams);
+    for (size_t i = 0; i < MAXNS; i++) {
+        EXPECT_TRUE(cacheStats[i] == expectedStats[i]);
+    }
+
+    // pass another list of IPSockAddr
+    const res_stats expectedStats2[MAXNS] = {
+            {{sample3, sample2}, 2, 2},
+            {{sample2}, 1, 1},
+            {{sample1}, 1, 1},
     };
-    for (const auto& config : testConfigs) {
-        EXPECT_EQ(config.networkType, convert_network_type(config.transportTypes));
+    nameserverSockAddrs = {
+            IPSockAddr::toIPSockAddr("fe80::3", DNS_PORT),
+            IPSockAddr::toIPSockAddr("::127.0.0.2", DNS_PORT),
+            IPSockAddr::toIPSockAddr("127.0.0.1", DNS_PORT),
+    };
+    cacheAddStats(TEST_NETID, revision_id, nameserverSockAddrs[0], sample2,
+                  setup.params.max_samples);
+    EXPECT_EQ(resolv_cache_get_resolver_stats(TEST_NETID, &params, cacheStats, nameserverSockAddrs),
+              revision_id);
+    EXPECT_TRUE(params == kParams);
+    for (size_t i = 0; i < MAXNS; i++) {
+        EXPECT_TRUE(cacheStats[i] == expectedStats2[i]);
     }
 }
 
@@ -961,8 +977,6 @@ TEST_F(ResolvCacheTest, DnsEventSubsampling) {
 }
 
 // TODO: Tests for NetConfig, including:
-//     - res_params
-//         -- resolv_cache_get_resolver_stats()
 //     - res_stats
 //         -- _resolv_cache_add_resolver_stats_sample()
 //         -- android_net_res_stats_get_info_for_net()

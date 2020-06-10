@@ -985,7 +985,6 @@ struct NetConfig {
         cache = std::make_unique<Cache>();
         dns_event_subsampling_map = resolv_get_dns_event_subsampling_map();
     }
-
     int nameserverCount() { return nameserverSockAddrs.size(); }
 
     const unsigned netid;
@@ -1191,7 +1190,9 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, const void* query, int que
     // possible to cache the answer of this query.
     // If ANDROID_RESOLV_NO_CACHE_STORE is set, return RESOLV_CACHE_SKIP to skip possible cache
     // storing.
-    if (flags & ANDROID_RESOLV_NO_CACHE_LOOKUP) {
+    // (b/150371903): ANDROID_RESOLV_NO_CACHE_STORE should imply ANDROID_RESOLV_NO_CACHE_LOOKUP
+    // to avoid side channel attack.
+    if (flags & (ANDROID_RESOLV_NO_CACHE_LOOKUP | ANDROID_RESOLV_NO_CACHE_STORE)) {
         return flags & ANDROID_RESOLV_NO_CACHE_STORE ? RESOLV_CACHE_SKIP : RESOLV_CACHE_NOTFOUND;
     }
     Entry key;
@@ -1222,10 +1223,6 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, const void* query, int que
 
     if (e == NULL) {
         LOG(INFO) << __func__ << ": NOT IN CACHE";
-        // If it is no-cache-store mode, we won't wait for possible query.
-        if (flags & ANDROID_RESOLV_NO_CACHE_STORE) {
-            return RESOLV_CACHE_SKIP;
-        }
 
         if (!cache_has_pending_request_locked(cache, &key, true)) {
             return RESOLV_CACHE_NOTFOUND;
@@ -1265,7 +1262,7 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, const void* query, int que
         LOG(INFO) << __func__ << ": NOT IN CACHE (STALE ENTRY " << *lookup << "DISCARDED)";
         res_pquery(e->query, e->querylen);
         _cache_remove_p(cache, lookup);
-        return (flags & ANDROID_RESOLV_NO_CACHE_STORE) ? RESOLV_CACHE_SKIP : RESOLV_CACHE_NOTFOUND;
+        return RESOLV_CACHE_NOTFOUND;
     }
 
     *answerlen = e->answerlen;
@@ -1938,10 +1935,21 @@ static android::net::NetworkType to_stats_network_type(int32_t mainType, bool wi
 }
 
 android::net::NetworkType convert_network_type(const std::vector<int32_t>& transportTypes) {
-    // The valid transportTypes size is either 1 or 2.
-    if (transportTypes.size() > 2 || transportTypes.size() == 0) return android::net::NT_UNKNOWN;
+    // The valid transportTypes size is 1 to 3.
+    if (transportTypes.size() > 3 || transportTypes.size() == 0) return android::net::NT_UNKNOWN;
     // TransportTypes size == 1, map the type to stats network type directly.
     if (transportTypes.size() == 1) return to_stats_network_type(transportTypes[0], false);
+    // TransportTypes size == 3, only cellular + wifi + vpn is valid.
+    if (transportTypes.size() == 3) {
+        std::vector<int32_t> sortedTransTypes = transportTypes;
+        std::sort(sortedTransTypes.begin(), sortedTransTypes.end());
+        if (sortedTransTypes != std::vector<int32_t>{IDnsResolver::TRANSPORT_CELLULAR,
+                                                     IDnsResolver::TRANSPORT_WIFI,
+                                                     IDnsResolver::TRANSPORT_VPN}) {
+            return android::net::NT_UNKNOWN;
+        }
+        return android::net::NT_WIFI_CELLULAR_VPN;
+    }
     // TransportTypes size == 2, it shoud be 1 main type + vpn type.
     // Otherwise, consider it as UNKNOWN.
     bool hasVpn = false;
@@ -1980,6 +1988,8 @@ static const char* transport_type_to_str(const std::vector<int32_t>& transportTy
             return "BLUETOOTH_VPN";
         case android::net::NT_ETHERNET_VPN:
             return "ETHERNET_VPN";
+        case android::net::NT_WIFI_CELLULAR_VPN:
+            return "WIFI_CELLULAR_VPN";
         default:
             return "UNKNOWN";
     }
