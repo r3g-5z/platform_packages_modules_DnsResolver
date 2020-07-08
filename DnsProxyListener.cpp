@@ -34,7 +34,6 @@
 #include <algorithm>
 #include <vector>
 
-#include <NetdClient.h>  // NETID_USE_LOCAL_NAMESERVERS
 #include <android-base/stringprintf.h>
 #include <android/multinetwork.h>  // ResNsendFlags
 #include <cutils/misc.h>           // FIRST_APPLICATION_UID
@@ -53,6 +52,7 @@
 #include "NetdPermissions.h"
 #include "PrivateDnsConfiguration.h"
 #include "ResolverEventReporter.h"
+#include "dnsproxyd_protocol/DnsProxydProtocol.h"  // NETID_USE_LOCAL_NAMESERVERS
 #include "getaddrinfo.h"
 #include "gethnamaddr.h"
 #include "res_send.h"
@@ -308,7 +308,7 @@ PrivateDnsModes getPrivateDnsModeForMetrics(uint32_t netId) {
 }
 
 void initDnsEvent(NetworkDnsEventReported* event, const android_net_context& netContext) {
-    // The value 0 has the special meaning of unset/unknown in Westworld atoms. So, we set both
+    // The value 0 has the special meaning of unset/unknown in Statsd atoms. So, we set both
     // flags to -1 as default value.
     //  1. The hints flag is only used in resolv_getaddrinfo. When user set it to -1 in
     //     resolv_getaddrinfo, the flag will cause validation (validateHints) failure in

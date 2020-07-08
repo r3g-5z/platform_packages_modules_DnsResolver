@@ -1003,6 +1003,7 @@ struct NetConfig {
     // If resolverParams.hosts is empty, the existing customized table will be erased.
     HostMapping customizedTable = {};
     int tc_mode = aidl::android::net::IDnsResolver::TC_MODE_DEFAULT;
+    bool enforceDnsUid = false;
     std::vector<int32_t> transportTypes;
 };
 
@@ -1190,7 +1191,9 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, const void* query, int que
     // possible to cache the answer of this query.
     // If ANDROID_RESOLV_NO_CACHE_STORE is set, return RESOLV_CACHE_SKIP to skip possible cache
     // storing.
-    if (flags & ANDROID_RESOLV_NO_CACHE_LOOKUP) {
+    // (b/150371903): ANDROID_RESOLV_NO_CACHE_STORE should imply ANDROID_RESOLV_NO_CACHE_LOOKUP
+    // to avoid side channel attack.
+    if (flags & (ANDROID_RESOLV_NO_CACHE_LOOKUP | ANDROID_RESOLV_NO_CACHE_STORE)) {
         return flags & ANDROID_RESOLV_NO_CACHE_STORE ? RESOLV_CACHE_SKIP : RESOLV_CACHE_NOTFOUND;
     }
     Entry key;
@@ -1221,10 +1224,6 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, const void* query, int que
 
     if (e == NULL) {
         LOG(INFO) << __func__ << ": NOT IN CACHE";
-        // If it is no-cache-store mode, we won't wait for possible query.
-        if (flags & ANDROID_RESOLV_NO_CACHE_STORE) {
-            return RESOLV_CACHE_SKIP;
-        }
 
         if (!cache_has_pending_request_locked(cache, &key, true)) {
             return RESOLV_CACHE_NOTFOUND;
@@ -1264,7 +1263,7 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, const void* query, int que
         LOG(INFO) << __func__ << ": NOT IN CACHE (STALE ENTRY " << *lookup << "DISCARDED)";
         res_pquery(e->query, e->querylen);
         _cache_remove_p(cache, lookup);
-        return (flags & ANDROID_RESOLV_NO_CACHE_STORE) ? RESOLV_CACHE_SKIP : RESOLV_CACHE_NOTFOUND;
+        return RESOLV_CACHE_NOTFOUND;
     }
 
     *answerlen = e->answerlen;
@@ -1647,6 +1646,7 @@ int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& serve
         return -EINVAL;
     }
     netconfig->tc_mode = resolverOptions.tcMode;
+    netconfig->enforceDnsUid = resolverOptions.enforceDnsUid;
 
     netconfig->transportTypes = transportTypes;
 
@@ -1685,6 +1685,7 @@ void resolv_populate_res_for_net(ResState* statp) {
     statp->nsaddrs = info->nameserverSockAddrs;
     statp->search_domains = info->search_domains;
     statp->tc_mode = info->tc_mode;
+    statp->enforce_dns_uid = info->enforceDnsUid;
 }
 
 /* Resolver reachability statistics. */
