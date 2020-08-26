@@ -60,6 +60,7 @@
 #include <server_configurable_flags/get_flags.h>
 
 #include "DnsStats.h"
+#include "Experiments.h"
 #include "res_comp.h"
 #include "res_debug.h"
 #include "resolv_private.h"
@@ -69,6 +70,7 @@ using aidl::android::net::IDnsResolver;
 using android::base::StringAppendF;
 using android::net::DnsQueryEvent;
 using android::net::DnsStats;
+using android::net::Experiments;
 using android::net::PROTO_DOT;
 using android::net::PROTO_TCP;
 using android::net::PROTO_UDP;
@@ -1003,6 +1005,7 @@ struct NetConfig {
     // If resolverParams.hosts is empty, the existing customized table will be erased.
     HostMapping customizedTable = {};
     int tc_mode = aidl::android::net::IDnsResolver::TC_MODE_DEFAULT;
+    bool enforceDnsUid = false;
     std::vector<int32_t> transportTypes;
 };
 
@@ -1645,6 +1648,7 @@ int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& serve
         return -EINVAL;
     }
     netconfig->tc_mode = resolverOptions.tcMode;
+    netconfig->enforceDnsUid = resolverOptions.enforceDnsUid;
 
     netconfig->transportTypes = transportTypes;
 
@@ -1680,9 +1684,13 @@ void resolv_populate_res_for_net(ResState* statp) {
     NetConfig* info = find_netconfig_locked(statp->netid);
     if (info == nullptr) return;
 
-    statp->nsaddrs = info->nameserverSockAddrs;
+    const bool sortNameservers = Experiments::getInstance()->getFlag("sort_nameservers", 0);
+    statp->sort_nameservers = sortNameservers;
+    statp->nsaddrs = sortNameservers ? info->dnsStats.getSortedServers(PROTO_UDP)
+                                     : info->nameserverSockAddrs;
     statp->search_domains = info->search_domains;
     statp->tc_mode = info->tc_mode;
+    statp->enforce_dns_uid = info->enforceDnsUid;
 }
 
 /* Resolver reachability statistics. */

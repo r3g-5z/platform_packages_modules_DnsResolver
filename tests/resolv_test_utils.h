@@ -62,6 +62,18 @@ class ScopeBlockedUIDRule {
     const uid_t mSavedUid;
 };
 
+class ScopedChangeUID {
+  public:
+    ScopedChangeUID(uid_t testUid) : mTestUid(testUid), mSavedUid(getuid()) {
+        EXPECT_TRUE(seteuid(mTestUid) == 0);
+    };
+    ~ScopedChangeUID() { EXPECT_TRUE(seteuid(mSavedUid) == 0); }
+
+  private:
+    const uid_t mTestUid;
+    const uid_t mSavedUid;
+};
+
 struct DnsRecord {
     std::string host_name;  // host name
     ns_type type;           // record type
@@ -70,8 +82,9 @@ struct DnsRecord {
 
 // TODO: make this dynamic and stop depending on implementation details.
 constexpr int TEST_NETID = 30;
-// Use maximum reserved appId for applications to avoid conflict with existing uids.
+// Use the biggest two reserved appId for applications to avoid conflict with existing uids.
 constexpr int TEST_UID = 99999;
+constexpr int TEST_UID2 = 99998;
 
 static constexpr char kLocalHost[] = "localhost";
 static constexpr char kLocalHostAddr[] = "127.0.0.1";
