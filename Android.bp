@@ -32,6 +32,7 @@ aidl_interface {
             apex_available: [
                 "//apex_available:platform",
                 "com.android.bluetooth.updatable",
+                "com.android.wifi",
             ],
         },
         ndk: {
@@ -134,7 +135,7 @@ cc_library {
         "libstatslog_resolv",
         "libstatspush_compat",
         "libsysutils",
-        "netd_event_listener_interface-ndk_platform",
+        "netd_event_listener_interface-unstable-ndk_platform",
         "server_configurable_flags",
         "stats_proto",
     ],
@@ -239,7 +240,7 @@ filegroup {
 cc_test {
     name: "resolv_unit_test",
     test_suites: [
-        "device-tests",
+        "general-tests",
         "mts",
     ],
     require_root: true,
@@ -267,7 +268,7 @@ cc_test {
     static_libs: [
         "dnsresolver_aidl_interface-unstable-ndk_platform",
         "netd_aidl_interface-ndk_platform",
-        "netd_event_listener_interface-ndk_platform",
+        "netd_event_listener_interface-unstable-ndk_platform",
         "libcutils",
         "libgmock",
         "libnetd_resolv",
