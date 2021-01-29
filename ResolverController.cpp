@@ -22,8 +22,6 @@
 #include <string>
 #include <vector>
 
-#include <netdb.h>
-
 #include <aidl/android/net/IDnsResolver.h>
 #include <android-base/logging.h>
 #include <android-base/strings.h>
@@ -37,6 +35,8 @@
 #include "stats.h"
 
 using aidl::android::net::ResolverParamsParcel;
+using aidl::android::net::resolv::aidl::IDnsResolverUnsolicitedEventListener;
+using aidl::android::net::resolv::aidl::Nat64PrefixEventParcel;
 
 namespace android {
 
@@ -46,49 +46,30 @@ namespace net {
 
 namespace {
 
-std::string addrToString(const sockaddr_storage* addr) {
-    char out[INET6_ADDRSTRLEN] = {0};
-    getnameinfo((const sockaddr*)addr, sizeof(sockaddr_storage), out, INET6_ADDRSTRLEN, nullptr, 0,
-                NI_NUMERICHOST);
-    return std::string(out);
-}
-
-const char* getPrivateDnsModeString(PrivateDnsMode mode) {
-    switch (mode) {
-        case PrivateDnsMode::OFF:
-            return "OFF";
-        case PrivateDnsMode::OPPORTUNISTIC:
-            return "OPPORTUNISTIC";
-        case PrivateDnsMode::STRICT:
-            return "STRICT";
-    }
-}
-
-constexpr const char* validationStatusToString(Validation value) {
-    switch (value) {
-        case Validation::in_process:
-            return "in_process";
-        case Validation::success:
-            return "success";
-        case Validation::fail:
-            return "fail";
-        case Validation::unknown_server:
-            return "unknown_server";
-        case Validation::unknown_netid:
-            return "unknown_netid";
-        default:
-            return "unknown_status";
-    }
-}
-
 void sendNat64PrefixEvent(const Dns64Configuration::Nat64PrefixInfo& args) {
+    LOG(DEBUG) << "Sending Nat64Prefix " << (args.added ? "added" : "removed") << " event on netId "
+               << args.netId << " with address {" << args.prefixString << "(" << args.prefixLength
+               << ")}";
+    // Send a nat64 prefix event to NetdEventListenerService.
     const auto& listeners = ResolverEventReporter::getInstance().getListeners();
-    if (listeners.size() == 0) {
-        LOG(ERROR) << __func__ << ": No available listener. dropping NAT64 prefix event";
-        return;
+    if (listeners.empty()) {
+        LOG(ERROR) << __func__ << ": No available listener. Skipping NAT64 prefix event";
     }
     for (const auto& it : listeners) {
         it->onNat64PrefixEvent(args.netId, args.added, args.prefixString, args.prefixLength);
+    }
+
+    const auto& unsolEventListeners = ResolverEventReporter::getInstance().getUnsolEventListeners();
+    const Nat64PrefixEventParcel nat64PrefixEvent = {
+            .netId = static_cast<int32_t>(args.netId),
+            .prefixOperation =
+                    args.added ? IDnsResolverUnsolicitedEventListener::PREFIX_OPERATION_ADDED
+                               : IDnsResolverUnsolicitedEventListener::PREFIX_OPERATION_REMOVED,
+            .prefixAddress = args.prefixString,
+            .prefixLength = args.prefixLength,
+    };
+    for (const auto& it : unsolEventListeners) {
+        it->onNat64PrefixEvent(nat64PrefixEvent);
     }
 }
 
@@ -201,6 +182,10 @@ int ResolverController::flushNetworkCache(unsigned netId) {
 int ResolverController::setResolverConfiguration(const ResolverParamsParcel& resolverParams) {
     using aidl::android::net::IDnsResolver;
 
+    if (!has_named_cache(resolverParams.netId)) {
+        return -ENOENT;
+    }
+
     // Expect to get the mark with system permission.
     android_net_context netcontext;
     gResNetdCallbacks.get_network_context(resolverParams.netId, 0 /* uid */, &netcontext);
@@ -220,6 +205,10 @@ int ResolverController::setResolverConfiguration(const ResolverParamsParcel& res
             resolverParams.caCertificate);
 
     if (err != 0) {
+        return err;
+    }
+
+    if (int err = resolv_stats_set_servers_for_dot(resolverParams.netId, tlsServers); err != 0) {
         return err;
     }
 
@@ -255,8 +244,8 @@ int ResolverController::getResolverInfo(int32_t netId, std::vector<std::string>*
     ResolverStats::encodeAll(res_stats, stats);
 
     const auto privateDnsStatus = PrivateDnsConfiguration::getInstance().getStatus(netId);
-    for (const auto& pair : privateDnsStatus.serversMap) {
-        tlsServers->push_back(addrToString(&pair.first.ss));
+    for (const auto& [server, _] : privateDnsStatus.serversMap) {
+        tlsServers->push_back(server.toIpString());
     }
 
     params->resize(IDnsResolver::RESOLVER_PARAMS_COUNT);
@@ -355,9 +344,9 @@ void ResolverController::dump(DumpWriter& dw, unsigned netId) {
             dw.println("Private DNS configuration (%u entries)",
                        static_cast<uint32_t>(privateDnsStatus.serversMap.size()));
             dw.incIndent();
-            for (const auto& pair : privateDnsStatus.serversMap) {
-                dw.println("%s name{%s} status{%s}", addrToString(&pair.first.ss).c_str(),
-                           pair.first.name.c_str(), validationStatusToString(pair.second));
+            for (const auto& [server, validation] : privateDnsStatus.serversMap) {
+                dw.println("%s name{%s} status{%s}", server.toIpString().c_str(),
+                           server.name.c_str(), validationStatusToString(validation));
             }
             dw.decIndent();
         }
