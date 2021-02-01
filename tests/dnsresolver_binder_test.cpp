@@ -40,6 +40,7 @@
 
 #include "dns_metrics_listener/base_metrics_listener.h"
 #include "dns_metrics_listener/test_metrics.h"
+#include "unsolicited_listener/unsolicited_event_listener.h"
 
 #include "ResolverStats.h"
 #include "dns_responder.h"
@@ -55,6 +56,7 @@ using android::base::StringPrintf;
 using android::base::unique_fd;
 using android::net::ResolverStats;
 using android::net::metrics::TestOnDnsEvent;
+using android::net::resolv::aidl::UnsolicitedEventListener;
 using android::netdutils::Stopwatch;
 
 // TODO: make this dynamic and stop depending on implementation details.
@@ -121,8 +123,9 @@ class DnsResolverBinderTest : public ::testing::Test {
         // Basic regexp to match dump output lines. Matches the beginning and end of the line, and
         // puts the output of the command itself into the first match group.
         // Example: "      11-05 00:23:39.481 myCommand(args) <2.02ms>".
+        // Note: There are 4 leading blank characters in Q, but 6 in R.
         const std::basic_regex lineRegex(
-                "^      [0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3} "
+                "^ {4,6}[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3} "
                 "(.*)"
                 " <[0-9]+[.][0-9]{2}ms>$");
 
@@ -272,21 +275,49 @@ TEST_F(DnsResolverBinderTest, RegisterEventListener_NullListener) {
 }
 
 TEST_F(DnsResolverBinderTest, RegisterEventListener_DuplicateSubscription) {
-    class DummyListener : public android::net::metrics::BaseMetricsListener {};
+    class FakeListener : public android::net::metrics::BaseMetricsListener {};
 
     // Expect to subscribe successfully.
-    std::shared_ptr<DummyListener> dummyListener = ndk::SharedRefBase::make<DummyListener>();
-    ::ndk::ScopedAStatus status = mDnsResolver->registerEventListener(dummyListener);
+    std::shared_ptr<FakeListener> fakeListener = ndk::SharedRefBase::make<FakeListener>();
+    ::ndk::ScopedAStatus status = mDnsResolver->registerEventListener(fakeListener);
     ASSERT_TRUE(status.isOk()) << status.getMessage();
     mExpectedLogData.push_back({"registerEventListener()", "registerEventListener.*"});
 
     // Expect to subscribe failed with registered listener instance.
-    status = mDnsResolver->registerEventListener(dummyListener);
+    status = mDnsResolver->registerEventListener(fakeListener);
     ASSERT_FALSE(status.isOk());
     ASSERT_EQ(EEXIST, status.getServiceSpecificError());
     mExpectedLogData.push_back(
             {"registerEventListener() -> ServiceSpecificException(17, \"File exists\")",
              "registerEventListener.*17"});
+}
+
+TEST_F(DnsResolverBinderTest, RegisterUnsolicitedEventListener_NullListener) {
+    ::ndk::ScopedAStatus status = mDnsResolver->registerUnsolicitedEventListener(nullptr);
+    ASSERT_FALSE(status.isOk());
+    ASSERT_EQ(EINVAL, status.getServiceSpecificError());
+    mExpectedLogData.push_back(
+            {"registerUnsolicitedEventListener() -> ServiceSpecificException(22, \"Invalid "
+             "argument\")",
+             "registerUnsolicitedEventListener.*22"});
+}
+
+TEST_F(DnsResolverBinderTest, RegisterUnsolicitedEventListener_DuplicateSubscription) {
+    // Expect to subscribe successfully.
+    std::shared_ptr<UnsolicitedEventListener> listener =
+            ndk::SharedRefBase::make<UnsolicitedEventListener>(TEST_NETID);
+    ::ndk::ScopedAStatus status = mDnsResolver->registerUnsolicitedEventListener(listener);
+    ASSERT_TRUE(status.isOk()) << status.getMessage();
+    mExpectedLogData.push_back(
+            {"registerUnsolicitedEventListener()", "registerUnsolicitedEventListener.*"});
+
+    // Expect to subscribe failed with registered listener instance.
+    status = mDnsResolver->registerUnsolicitedEventListener(listener);
+    ASSERT_FALSE(status.isOk());
+    ASSERT_EQ(EEXIST, status.getServiceSpecificError());
+    mExpectedLogData.push_back(
+            {"registerUnsolicitedEventListener() -> ServiceSpecificException(17, \"File exists\")",
+             "registerUnsolicitedEventListener.*17"});
 }
 
 // TODO: Move this test to resolv_integration_test.cpp
