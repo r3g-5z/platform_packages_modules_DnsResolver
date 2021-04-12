@@ -30,6 +30,10 @@ license {
     ],
 }
 
+// Whether to enable the targets in this file that require rust toolchain.
+// Set to false in branches like mainline-prod where rust toolchain isn't supported.
+support_rust_toolchain = false
+
 cc_library_headers {
     name: "libnetd_resolv_headers",
     export_include_dirs: ["include"],
@@ -51,7 +55,7 @@ cc_library_headers {
     ],
 }
 
-dnsresolver_aidl_interface_lateststable_version = "V7"
+dnsresolver_aidl_interface_lateststable_version = "V8"
 
 cc_library_static {
     name: "dnsresolver_aidl_interface-lateststable-ndk_platform",
@@ -102,7 +106,11 @@ aidl_interface {
         "5",
         "6",
         "7",
+        "8",
     ],
+    dumpapi: {
+        no_license: true,
+    },
 }
 
 cc_defaults {
@@ -287,54 +295,67 @@ filegroup {
     ],
 }
 
-// TODO: Move this test to tests/
-cc_test {
-    name: "resolv_unit_test",
-    test_suites: [
-        "general-tests",
-        "mts-dnsresolver",
-    ],
-    require_root: true,
-    // TODO: Drop root privileges and make it be an real unit test.
-    // TODO: Remove resolv_test_mts_coverage_defaults after mts coverage switched to 64-bit device.
-    defaults: [
-        "netd_defaults",
-        "resolv_test_defaults",
-        "resolv_test_mts_coverage_defaults",
-    ],
+filegroup {
+    name: "resolv_unit_test_files",
     srcs: [
-        "resolv_cache_unit_test.cpp",
-        "resolv_callback_unit_test.cpp",
-        "resolv_tls_unit_test.cpp",
-        "resolv_unit_test.cpp",
         "DnsQueryLogTest.cpp",
         "DnsStatsTest.cpp",
         "ExperimentsTest.cpp",
         "OperationLimiterTest.cpp",
         "PrivateDnsConfigurationTest.cpp",
     ],
-    shared_libs: [
-        "libcrypto",
-        "libbinder_ndk",
-        "libssl",
-    ],
-    static_libs: [
-        "dnsresolver_aidl_interface-lateststable-ndk_platform",
-        "netd_aidl_interface-lateststable-ndk_platform",
-        "netd_event_listener_interface-lateststable-ndk_platform",
-        "libcutils",
-        "libgmock",
-        "libnetd_resolv",
-        "libnetd_test_dnsresponder_ndk",
-        "libnetd_test_resolv_utils",
-        "libnetdutils",
-        "libprotobuf-cpp-lite",
-        "libstatslog_resolv",
-        "libstatspush_compat",
-        "libsysutils",
-        "libutils",
-        "resolv_stats_test_utils",
-        "server_configurable_flags",
-        "stats_proto",
-    ],
 }
+
+// rust_ffi_static {
+//     name: "libdoh_ffi",
+//     enabled: support_rust_toolchain,
+//     crate_name: "doh",
+//     srcs: ["doh.rs"],
+//     edition: "2018",
+
+//     rlibs: [
+//         "libandroid_logger",
+//         "libanyhow",
+//         "liblazy_static",
+//         "liblibc",
+//         "liblog_rust",
+//         "libquiche",
+//         "libring",
+//         "libtokio",
+//         "liburl",
+//     ],
+//     prefer_rlib: true,
+
+//     shared_libs: [
+//         "libcrypto",
+//         "libssl",
+//     ],
+
+//     apex_available: [
+//         "//apex_available:platform",  // Needed by doh_ffi_test
+//         "com.android.resolv"
+//     ],
+//     min_sdk_version: "29",
+// }
+
+// cc_test {
+//     name: "doh_ffi_test",
+//     enabled: support_rust_toolchain,
+//     test_suites: [
+//         "general-tests",
+//     ],
+//     defaults: ["netd_defaults"],
+//     srcs: ["doh_ffi_test.cpp"],
+//     static_libs: [
+//         "libdoh_ffi",
+//         "libgmock",
+//         "liblog",
+//         "libring-core",
+//     ],
+//     // These are not carried over from libdoh_ffi.
+//     shared_libs: [
+//         "libcrypto",
+//         "libssl",
+//     ],
+//     min_sdk_version: "29",
+// }
