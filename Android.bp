@@ -1,3 +1,39 @@
+package {
+    default_applicable_licenses: ["packages_modules_DnsResolver_license"],
+}
+
+// Added automatically by a large-scale-change that took the approach of
+// 'apply every license found to every target'. While this makes sure we respect
+// every license restriction, it may not be entirely correct.
+//
+// e.g. GPL in an MIT project might only apply to the contrib/ directory.
+//
+// Please consider splitting the single license below into multiple licenses,
+// taking care not to lose any license_kind information, and overriding the
+// default license using the 'licenses: [...]' property on targets as needed.
+//
+// For unused files, consider creating a 'fileGroup' with "//visibility:private"
+// to attach the license to, and including a comment whether the files may be
+// used in the current project.
+// See: http://go/android-license-faq
+license {
+    name: "packages_modules_DnsResolver_license",
+    visibility: [":__subpackages__"],
+    license_kinds: [
+        "SPDX-license-identifier-Apache-2.0",
+        "SPDX-license-identifier-BSD",
+        "SPDX-license-identifier-ISC",
+        "SPDX-license-identifier-MIT",
+    ],
+    license_text: [
+        "NOTICE",
+    ],
+}
+
+// Whether to enable the targets in this file that require rust toolchain.
+// Set to false in branches like mainline-prod where rust toolchain isn't supported.
+support_rust_toolchain = false
+
 cc_library_headers {
     name: "libnetd_resolv_headers",
     export_include_dirs: ["include"],
@@ -17,6 +53,19 @@ cc_library_headers {
         "//apex_available:platform",
         "com.android.tethering",
     ],
+}
+
+dnsresolver_aidl_interface_lateststable_version = "V8"
+
+cc_library_static {
+    name: "dnsresolver_aidl_interface-lateststable-ndk_platform",
+    whole_static_libs: [
+        "dnsresolver_aidl_interface-ndk_platform",
+    ],
+    apex_available: [
+        "com.android.resolv",
+    ],
+    min_sdk_version: "29",
 }
 
 aidl_interface {
@@ -57,7 +106,11 @@ aidl_interface {
         "5",
         "6",
         "7",
+        "8",
     ],
+    dumpapi: {
+        no_license: true,
+    },
 }
 
 cc_defaults {
@@ -133,7 +186,7 @@ cc_library {
     // Link most things statically to minimize our dependence on system ABIs.
     stl: "libc++_static",
     static_libs: [
-        "dnsresolver_aidl_interface-ndk_platform",
+        "dnsresolver_aidl_interface-lateststable-ndk_platform",
         "libbase",
         "libcutils",
         "libnetdutils",
@@ -141,7 +194,7 @@ cc_library {
         "libstatslog_resolv",
         "libstatspush_compat",
         "libsysutils",
-        "netd_event_listener_interface-ndk_platform",
+        "netd_event_listener_interface-lateststable-ndk_platform",
         "server_configurable_flags",
         "stats_proto",
     ],
@@ -228,11 +281,20 @@ cc_library_static {
     export_generated_headers: ["statslog_resolv.h"],
     static_libs: [
         "libcutils",
-        "libgtest_prod", // Used by libstatspush_compat
         "libstatspush_compat",
+    ],
+    header_libs: [
+        "libgtest_prod_headers", // Used by libstatspush_compat
     ],
     apex_available: ["com.android.resolv"],
     min_sdk_version: "29",
+}
+
+filegroup {
+    name: "resolv_rust_test_config_template",
+    srcs: [
+        "resolv_rust_test_config_template.xml",
+    ],
 }
 
 filegroup {
@@ -242,54 +304,92 @@ filegroup {
     ],
 }
 
-// TODO: Move this test to tests/
-cc_test {
-    name: "resolv_unit_test",
-    test_suites: [
-        "general-tests",
-        "mts",
-    ],
-    require_root: true,
-    // TODO: Drop root privileges and make it be an real unit test.
-    // TODO: Remove resolv_test_mts_coverage_defaults after mts coverage switched to 64-bit device.
-    defaults: [
-        "netd_defaults",
-        "resolv_test_defaults",
-        "resolv_test_mts_coverage_defaults",
-    ],
+filegroup {
+    name: "resolv_unit_test_files",
     srcs: [
-        "resolv_cache_unit_test.cpp",
-        "resolv_callback_unit_test.cpp",
-        "resolv_tls_unit_test.cpp",
-        "resolv_unit_test.cpp",
         "DnsQueryLogTest.cpp",
         "DnsStatsTest.cpp",
         "ExperimentsTest.cpp",
         "OperationLimiterTest.cpp",
         "PrivateDnsConfigurationTest.cpp",
     ],
-    shared_libs: [
-        "libcrypto",
-        "libbinder_ndk",
-        "libssl",
-    ],
-    static_libs: [
-        "dnsresolver_aidl_interface-unstable-ndk_platform",
-        "netd_aidl_interface-ndk_platform",
-        "netd_event_listener_interface-unstable-ndk_platform",
-        "libcutils",
-        "libgmock",
-        "libnetd_resolv",
-        "libnetd_test_dnsresponder_ndk",
-        "libnetd_test_resolv_utils",
-        "libnetdutils",
-        "libprotobuf-cpp-lite",
-        "libstatslog_resolv",
-        "libstatspush_compat",
-        "libsysutils",
-        "libutils",
-        "resolv_stats_test_utils",
-        "server_configurable_flags",
-        "stats_proto",
-    ],
 }
+
+// rust_ffi_static {
+//     name: "libdoh_ffi",
+//     enabled: support_rust_toolchain,
+//     crate_name: "doh",
+//     srcs: ["doh.rs"],
+//     edition: "2018",
+
+//     rlibs: [
+//         "libandroid_logger",
+//         "libanyhow",
+//         "liblazy_static",
+//         "liblibc",
+//         "liblog_rust",
+//         "libquiche",
+//         "libring",
+//         "libtokio",
+//         "liburl",
+//     ],
+//     prefer_rlib: true,
+
+//     shared_libs: [
+//         "libcrypto",
+//         "libssl",
+//     ],
+
+//     apex_available: [
+//         "//apex_available:platform",  // Needed by doh_ffi_test
+//         "com.android.resolv"
+//     ],
+//     min_sdk_version: "29",
+// }
+
+// cc_test {
+//     name: "doh_ffi_test",
+//     enabled: support_rust_toolchain,
+//     test_suites: [
+//         "general-tests",
+//     ],
+//     defaults: ["netd_defaults"],
+//     srcs: ["doh_ffi_test.cpp"],
+//     static_libs: [
+//         "libdoh_ffi",
+//         "libgmock",
+//         "liblog",
+//         "libring-core",
+//     ],
+//     // These are not carried over from libdoh_ffi.
+//     shared_libs: [
+//         "libcrypto",
+//         "libssl",
+//     ],
+//     min_sdk_version: "29",
+// }
+
+// rust_test {
+//     name: "doh_unit_test",
+//     enabled: support_rust_toolchain,
+//     crate_name: "doh",
+//     srcs: ["doh.rs"],
+//     edition: "2018",
+//     test_suites: ["general-tests"],
+//     auto_gen_config: true,
+//     // Used to enable root permission for the test.
+//     // TODO: remove after 'require_root' is supported in rust_test.
+//     test_config_template: ":resolv_rust_test_config_template",
+//     rustlibs: [
+//         "libandroid_logger",
+//         "libanyhow",
+//         "liblazy_static",
+//         "liblibc",
+//         "liblog_rust",
+//         "libquiche",
+//         "libring",
+//         "libtokio",
+//         "liburl",
+//     ],
+//     min_sdk_version: "29",
+// }
