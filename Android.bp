@@ -30,10 +30,6 @@ license {
     ],
 }
 
-// Whether to enable the targets in this file that require rust toolchain.
-// Set to false in branches like mainline-prod where rust toolchain isn't supported.
-support_rust_toolchain = false
-
 cc_library_headers {
     name: "libnetd_resolv_headers",
     export_include_dirs: ["include"],
@@ -48,6 +44,8 @@ cc_library_headers {
 
 cc_library_headers {
     name: "dnsproxyd_protocol_headers",
+    sdk_version: "29",
+    min_sdk_version: "29",
     export_include_dirs: ["include/dnsproxyd_protocol"],
     apex_available: [
         "//apex_available:platform",
@@ -60,7 +58,7 @@ dnsresolver_aidl_interface_lateststable_version = "V8"
 cc_library_static {
     name: "dnsresolver_aidl_interface-lateststable-ndk_platform",
     whole_static_libs: [
-        "dnsresolver_aidl_interface-ndk_platform",
+        "dnsresolver_aidl_interface-" + dnsresolver_aidl_interface_lateststable_version + "-ndk_platform",
     ],
     apex_available: [
         "com.android.resolv",
@@ -85,10 +83,11 @@ aidl_interface {
     backend: {
         java: {
             apex_available: [
-                "//apex_available:platform",
                 "com.android.bluetooth.updatable",
+                "com.android.tethering",
                 "com.android.wifi",
             ],
+            min_sdk_version: "30",
         },
         ndk: {
             gen_log: true,
@@ -123,6 +122,8 @@ cc_defaults {
         "libbase",
         "liblog",
     ],
+    // This field is required to make test compatible with Q devices.
+    min_sdk_version: "29",
 }
 
 cc_defaults {
@@ -315,81 +316,57 @@ filegroup {
     ],
 }
 
-// rust_ffi_static {
-//     name: "libdoh_ffi",
-//     enabled: support_rust_toolchain,
-//     crate_name: "doh",
-//     srcs: ["doh.rs"],
-//     edition: "2018",
+rust_ffi_static {
+    name: "libdoh_ffi",
+    crate_name: "doh",
+    srcs: ["doh.rs"],
+    edition: "2018",
 
-//     rlibs: [
-//         "libandroid_logger",
-//         "libanyhow",
-//         "liblazy_static",
-//         "liblibc",
-//         "liblog_rust",
-//         "libquiche",
-//         "libring",
-//         "libtokio",
-//         "liburl",
-//     ],
-//     prefer_rlib: true,
+    rlibs: [
+        "libandroid_logger",
+        "libanyhow",
+        "liblazy_static",
+        "liblibc",
+        "liblog_rust",
+        "libquiche",
+        "libring",
+        "libtokio",
+        "liburl",
+    ],
+    prefer_rlib: true,
 
-//     shared_libs: [
-//         "libcrypto",
-//         "libssl",
-//     ],
+    shared_libs: [
+        "libcrypto",
+        "libssl",
+    ],
 
-//     apex_available: [
-//         "//apex_available:platform",  // Needed by doh_ffi_test
-//         "com.android.resolv"
-//     ],
-//     min_sdk_version: "29",
-// }
+    apex_available: [
+        "//apex_available:platform",  // Needed by doh_ffi_test
+        "com.android.resolv"
+    ],
+    min_sdk_version: "29",
+}
 
-// cc_test {
-//     name: "doh_ffi_test",
-//     enabled: support_rust_toolchain,
-//     test_suites: [
-//         "general-tests",
-//     ],
-//     defaults: ["netd_defaults"],
-//     srcs: ["doh_ffi_test.cpp"],
-//     static_libs: [
-//         "libdoh_ffi",
-//         "libgmock",
-//         "liblog",
-//         "libring-core",
-//     ],
-//     // These are not carried over from libdoh_ffi.
-//     shared_libs: [
-//         "libcrypto",
-//         "libssl",
-//     ],
-//     min_sdk_version: "29",
-// }
-
-// rust_test {
-//     name: "doh_unit_test",
-//     enabled: support_rust_toolchain,
-//     crate_name: "doh",
-//     srcs: ["doh.rs"],
-//     edition: "2018",
-//     test_suites: ["general-tests"],
-//     auto_gen_config: true,
-//     // Used to enable root permission for the test.
-//     // TODO: remove after 'require_root' is supported in rust_test.
-//     test_config_template: ":resolv_rust_test_config_template",
-//     rustlibs: [
-//         "libandroid_logger",
-//         "libanyhow",
-//         "liblazy_static",
-//         "liblibc",
-//         "liblog_rust",
-//         "libquiche",
-//         "libring",
-//         "libtokio",
-//         "liburl",
-//     ],
-//     min_sdk_version: "29",
-// }
+rust_test {
+    name: "doh_unit_test",
+    crate_name: "doh",
+    srcs: ["doh.rs"],
+    edition: "2018",
+    test_suites: ["general-tests"],
+    auto_gen_config: true,
+    // Used to enable root permission for the test.
+    // TODO: remove after 'require_root' is supported in rust_test.
+    test_config_template: ":resolv_rust_test_config_template",
+    rustlibs: [
+        "libandroid_logger",
+        "libanyhow",
+        "liblazy_static",
+        "liblibc",
+        "liblog_rust",
+        "libquiche_static",
+        "libring",
+        "libtokio",
+        "liburl",
+    ],
+    min_sdk_version: "29",
+}
