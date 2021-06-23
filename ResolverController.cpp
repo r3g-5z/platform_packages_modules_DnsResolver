@@ -28,6 +28,7 @@
 
 #include "Dns64Configuration.h"
 #include "DnsResolver.h"
+#include "DnsTlsDispatcher.h"
 #include "PrivateDnsConfiguration.h"
 #include "ResolverEventReporter.h"
 #include "ResolverStats.h"
@@ -48,8 +49,8 @@ namespace {
 
 void sendNat64PrefixEvent(const Dns64Configuration::Nat64PrefixInfo& args) {
     LOG(DEBUG) << "Sending Nat64Prefix " << (args.added ? "added" : "removed") << " event on netId "
-               << args.netId << " with address {" << args.prefixString << "(" << args.prefixLength
-               << ")}";
+               << args.netId << " with prefix " << args.prefixString << "/"
+               << (int)(args.prefixLength);
     // Send a nat64 prefix event to NetdEventListenerService.
     const auto& listeners = ResolverEventReporter::getInstance().getListeners();
     if (listeners.empty()) {
@@ -166,6 +167,9 @@ void ResolverController::destroyNetworkCache(unsigned netId) {
     resolv_delete_cache_for_net(netId);
     mDns64Configuration.stopPrefixDiscovery(netId);
     PrivateDnsConfiguration::getInstance().clear(netId);
+
+    // Don't get this instance in PrivateDnsConfiguration. It's probe to deadlock.
+    DnsTlsDispatcher::getInstance().forceCleanup(netId);
 }
 
 int ResolverController::createNetworkCache(unsigned netId) {
