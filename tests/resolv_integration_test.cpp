@@ -60,6 +60,7 @@
 #include <android/binder_process.h>
 #include <bpf/BpfUtils.h>
 #include <util.h>  // getApiLevel
+#include "Experiments.h"
 #include "NetdClient.h"
 #include "ResolverStats.h"
 #include "netid_client.h"  // NETID_UNSET
@@ -88,7 +89,10 @@ const std::string kDotRevalidationThresholdFlag(
 const std::string kDotXportUnusableThresholdFlag(
         "persist.device_config.netd_native.dot_xport_unusable_threshold");
 const std::string kDotQueryTimeoutMsFlag("persist.device_config.netd_native.dot_query_timeout_ms");
-
+const std::string kDotValidationLatencyFactorFlag(
+        "persist.device_config.netd_native.dot_validation_latency_factor");
+const std::string kDotValidationLatencyOffsetMsFlag(
+        "persist.device_config.netd_native.dot_validation_latency_offset_ms");
 // Semi-public Bionic hook used by the NDK (frameworks/base/native/android/net.c)
 // Tested here for convenience.
 extern "C" int android_getaddrinfofornet(const char* hostname, const char* servname,
@@ -106,6 +110,7 @@ using aidl::android::net::resolv::aidl::IDnsResolverUnsolicitedEventListener;
 using aidl::android::net::resolv::aidl::Nat64PrefixEventParcel;
 using aidl::android::net::resolv::aidl::PrivateDnsValidationEventParcel;
 using android::base::Error;
+using android::base::GetProperty;
 using android::base::ParseInt;
 using android::base::Result;
 using android::base::StringPrintf;
@@ -233,12 +238,13 @@ class ResolverTest : public ::testing::Test {
         mDnsClient.SetUp();
         sDnsMetricsListener->reset();
         sUnsolicitedEventListener->reset();
+        SetMdnsRoute();
     }
 
     void TearDown() {
         // Ensure the dump works at the end of each test.
         DumpResolverService();
-
+        RemoveMdnsRoute();
         mDnsClient.TearDown();
     }
 
@@ -396,6 +402,66 @@ class ResolverTest : public ::testing::Test {
     static std::string getUniqueIPv4Address() {
         static int counter = 0;
         return fmt::format("127.0.100.{}", (++counter & 0xff));
+    }
+
+    int WaitChild(pid_t pid) {
+        int status;
+        const pid_t got_pid = TEMP_FAILURE_RETRY(waitpid(pid, &status, 0));
+
+        if (got_pid != pid) {
+            PLOG(WARNING) << __func__ << ": waitpid failed: wanted " << pid << ", got " << got_pid;
+            return 1;
+        }
+
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            return 0;
+        } else {
+            return status;
+        }
+    }
+
+    int ForkAndRun(const std::vector<std::string>& args) {
+        std::vector<const char*> argv;
+        argv.resize(args.size() + 1, nullptr);
+        std::transform(args.begin(), args.end(), argv.begin(),
+                       [](const std::string& in) { return in.c_str(); });
+
+        pid_t pid = fork();
+        if (pid == -1) {
+            // Fork failed.
+            PLOG(ERROR) << __func__ << ": Unable to fork";
+            return -1;
+        }
+
+        if (pid == 0) {
+            execv(argv[0], const_cast<char**>(argv.data()));
+            PLOG(ERROR) << __func__ << ": execv failed";
+            _exit(1);
+        }
+
+        int rc = WaitChild(pid);
+        if (rc != 0) {
+            PLOG(ERROR) << __func__ << ": Failed run: status=" << rc;
+        }
+        return rc;
+    }
+
+    // Add routing rules for MDNS packets, or MDNS packets won't know the destination is MDNS
+    // muticast address "224.0.0.251".
+    void SetMdnsRoute() {
+        const std::vector<std::string> args = {
+                "system/bin/ip", "route",  "add",   "local", "224.0.0.251", "dev",       "lo",
+                "proto",         "static", "scope", "host",  "src",         "127.0.0.1",
+        };
+        EXPECT_EQ(0, ForkAndRun(args));
+    }
+
+    void RemoveMdnsRoute() {
+        const std::vector<std::string> args = {
+                "system/bin/ip", "route",  "del",   "local", "224.0.0.251", "dev",       "lo",
+                "proto",         "static", "scope", "host",  "src",         "127.0.0.1",
+        };
+        EXPECT_EQ(0, ForkAndRun(args));
     }
 
     DnsResponderClient mDnsClient;
@@ -4141,7 +4207,17 @@ void expectDnsNetIdIsDefaultNetwork(INetd* netdService) {
 }
 
 void expectDnsNetIdWithVpn(INetd* netdService, unsigned vpnNetId, unsigned expectedNetId) {
-    EXPECT_TRUE(netdService->networkCreateVpn(vpnNetId, false /* secure */).isOk());
+    if (DnsResponderClient::isRemoteVersionSupported(netdService, 6)) {
+        const auto& config = DnsResponderClient::makeNativeNetworkConfig(
+                vpnNetId, NativeNetworkType::VIRTUAL, INetd::PERMISSION_NONE, /*secure=*/false);
+        EXPECT_TRUE(netdService->networkCreate(config).isOk());
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        EXPECT_TRUE(netdService->networkCreateVpn(vpnNetId, false /* secure */).isOk());
+#pragma clang diagnostic pop
+    }
+
     uid_t uid = getuid();
     // Add uid to VPN
     EXPECT_TRUE(netdService->networkAddUidRanges(vpnNetId, {makeUidRangeParcel(uid, uid)}).isOk());
@@ -4685,6 +4761,13 @@ TEST_F(ResolverTest, TlsServerRevalidation) {
         ScopedSystemProperties sp3(kDotQueryTimeoutMsFlag, std::to_string(dotQueryTimeoutMs));
         resetNetwork();
 
+        // This test is sensitive to the number of queries sent in DoT validation.
+        const int latencyFactor = std::stoi(GetProperty(kDotValidationLatencyFactorFlag, "-1"));
+        const int latencyOffsetMs = std::stoi(GetProperty(kDotValidationLatencyOffsetMsFlag, "-1"));
+        const bool dotValidationExtraProbes = (config.dnsMode == "OPPORTUNISTIC") &&
+                                              (latencyFactor >= 0 && latencyOffsetMs >= 0 &&
+                                               latencyFactor + latencyOffsetMs != 0);
+
         const std::string addr = getUniqueIPv4Address();
         test::DNSResponder dns(addr);
         StartDns(dns, records);
@@ -4697,7 +4780,11 @@ TEST_F(ResolverTest, TlsServerRevalidation) {
         if (config.dnsMode == "STRICT") parcel.tlsName = kDefaultPrivateDnsHostName;
         ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
         EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), true));
-        EXPECT_TRUE(tls.waitForQueries(1));
+        if (dotValidationExtraProbes) {
+            EXPECT_TRUE(tls.waitForQueries(2));
+        } else {
+            EXPECT_TRUE(tls.waitForQueries(1));
+        }
         tls.clearQueries();
         dns.clearQueries();
 
@@ -4739,9 +4826,15 @@ TEST_F(ResolverTest, TlsServerRevalidation) {
 
         // Step 5 and 6.
         int expectedDotQueries = queries;
+        int extraDnsProbe = 0;
         if (config.expectRevalidationHappen) {
             EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), true));
             expectedDotQueries++;
+
+            if (dotValidationExtraProbes) {
+                expectedDotQueries++;
+                extraDnsProbe = 1;
+            }
         }
 
         // Step 7 and 8.
@@ -4750,15 +4843,97 @@ TEST_F(ResolverTest, TlsServerRevalidation) {
         expectedDotQueries++;
 
         const int expectedDo53Queries =
-                expectedDotQueries + (config.dnsMode == "OPPORTUNISTIC" ? queries : 0);
+                expectedDotQueries +
+                (config.dnsMode == "OPPORTUNISTIC" ? (queries + extraDnsProbe) : 0);
 
         if (config.expectDotUnusable) {
             // A DoT server can be deemed as unusable only in opportunistic mode. When it happens,
             // the DnsResolver doesn't use the DoT server for a certain period of time.
             expectedDotQueries--;
         }
+
+        // This code makes the test more robust to race condition.
+        EXPECT_TRUE(tls.waitForQueries(expectedDotQueries));
+
         EXPECT_EQ(dns.queries().size(), static_cast<unsigned>(expectedDo53Queries));
         EXPECT_EQ(tls.queries(), expectedDotQueries);
+    }
+}
+
+// Verifies that private DNS validation fails if DoT server is much slower than cleartext server.
+TEST_F(ResolverTest, TlsServerValidation_UdpProbe) {
+    constexpr char backend_addr[] = "127.0.0.3";
+    test::DNSResponder backend(backend_addr);
+    backend.setResponseDelayMs(200);
+    ASSERT_TRUE(backend.startServer());
+
+    static const struct TestConfig {
+        int latencyFactor;
+        int latencyOffsetMs;
+        bool udpProbeLost;
+        size_t expectedUdpProbes;
+        bool expectedValidationPass;
+    } testConfigs[] = {
+            // clang-format off
+            {-1, -1,  false, 0, true},
+            {0,  0,   false, 0, true},
+            {1,  10,  false, 1, false},
+            {1,  10,  true,  2, false},
+            {5,  300, false, 1, true},
+            {5,  300, true,  2, true},
+            // clang-format on
+    };
+
+    for (const auto& config : testConfigs) {
+        SCOPED_TRACE(fmt::format("testConfig: [{}, {}, {}]", config.latencyFactor,
+                                 config.latencyOffsetMs, config.udpProbeLost));
+
+        const std::string addr = getUniqueIPv4Address();
+        test::DNSResponder dns(addr, "53", static_cast<ns_rcode>(-1));
+        test::DnsTlsFrontend tls(addr, "853", backend_addr, "53");
+        dns.setResponseDelayMs(10);
+        ASSERT_TRUE(dns.startServer());
+        ASSERT_TRUE(tls.startServer());
+
+        ScopedSystemProperties sp1(kDotValidationLatencyFactorFlag,
+                                   std::to_string(config.latencyFactor));
+        ScopedSystemProperties sp2(kDotValidationLatencyOffsetMsFlag,
+                                   std::to_string(config.latencyOffsetMs));
+        resetNetwork();
+
+        std::unique_ptr<std::thread> thread;
+        if (config.udpProbeLost) {
+            thread.reset(new std::thread([&dns]() {
+                // Simulate that the first UDP probe is lost and the second UDP probe succeeds.
+                dns.setResponseProbability(0.0);
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                dns.setResponseProbability(1.0);
+            }));
+        }
+
+        // Set up opportunistic mode, and wait for the validation complete.
+        auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+        parcel.servers = {addr};
+        parcel.tlsServers = {addr};
+        ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+        // The timeout of WaitForPrivateDnsValidation is 5 seconds which is still enough for
+        // the testcase of UDP probe lost because the retry of UDP probe happens after 3 seconds.
+        EXPECT_TRUE(
+                WaitForPrivateDnsValidation(tls.listen_address(), config.expectedValidationPass));
+        EXPECT_EQ(dns.queries().size(), config.expectedUdpProbes);
+        dns.clearQueries();
+
+        // Test that Private DNS validation always pass in strict mode.
+        parcel.tlsName = kDefaultPrivateDnsHostName;
+        ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+        EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), true));
+        EXPECT_EQ(dns.queries().size(), 0U);
+
+        if (thread) {
+            thread->join();
+            thread.reset();
+        }
     }
 }
 
@@ -5833,6 +6008,357 @@ TEST_F(ResolverTest, MultipleDotQueriesInOnePacket) {
     EXPECT_EQ(tls.queries(), 2);
 }
 
+TEST_F(ResolverTest, MdnsGetHostByName) {
+    constexpr char v6addr[] = "::127.0.0.3";
+    constexpr char v4addr[] = "127.0.0.3";
+    constexpr char host_name[] = "hello.local.";
+    constexpr char nonexistent_host_name[] = "nonexistent.local.";
+
+    test::DNSResponder mdnsv4("127.0.0.3", test::kDefaultMdnsListenService);
+    mdnsv4.addMapping(host_name, ns_type::ns_t_a, v4addr);
+    test::DNSResponder mdnsv6("::1", test::kDefaultMdnsListenService);
+    mdnsv6.addMapping(host_name, ns_type::ns_t_aaaa, v6addr);
+
+    ASSERT_TRUE(mdnsv4.startServer());
+    ASSERT_TRUE(mdnsv6.startServer());
+    mdnsv4.clearQueries();
+    mdnsv6.clearQueries();
+
+    std::vector<bool> keep_listening_udp_enable = {false, true};
+    for (int value : keep_listening_udp_enable) {
+        if (value == true) {
+            // Set keep_listening_udp enable
+            ScopedSystemProperties scopedSystemProperties(
+                    "persist.device_config.netd_native.keep_listening_udp", "1");
+            // Re-setup test network to make experiment flag take effect.
+            resetNetwork();
+        }
+        ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+
+        static const struct TestConfig {
+            int ai_family;
+            const std::string expected_addr;
+        } testConfigs[]{
+                {AF_INET, v4addr},
+                {AF_INET6, v6addr},
+        };
+
+        for (const auto& config : testConfigs) {
+            SCOPED_TRACE(StringPrintf("family: %d", config.ai_family));
+            const hostent* result = nullptr;
+
+            // No response for "nonexistent.local".
+            result = gethostbyname2("nonexistent.local", config.ai_family);
+            ASSERT_TRUE(result == nullptr);
+            test::DNSResponder& mdns = config.ai_family == AF_INET ? mdnsv4 : mdnsv6;
+            EXPECT_EQ(1U, GetNumQueries(mdns, nonexistent_host_name));
+            mdns.clearQueries();
+            EXPECT_EQ(HOST_NOT_FOUND, h_errno);
+
+            // Normal mDns query
+            result = gethostbyname2("hello.local", config.ai_family);
+            ASSERT_FALSE(result == nullptr);
+            EXPECT_EQ(1U, GetNumQueries(mdns, host_name));
+            int length = config.ai_family == AF_INET ? 4 : 16;
+            ASSERT_EQ(length, result->h_length);
+            ASSERT_FALSE(result->h_addr_list[0] == nullptr);
+            EXPECT_EQ(config.expected_addr, ToString(result));
+            EXPECT_TRUE(result->h_addr_list[1] == nullptr);
+            mdns.clearQueries();
+
+            // Ensure the query result is still cached.
+            result = gethostbyname2("hello.local", config.ai_family);
+            EXPECT_EQ(0U, GetNumQueries(mdnsv4, "hello.local."));
+            ASSERT_FALSE(result == nullptr);
+            EXPECT_EQ(config.expected_addr, ToString(result));
+            ASSERT_TRUE(mDnsClient.resolvService()->flushNetworkCache(TEST_NETID).isOk());
+        }
+    }
+}
+
+TEST_F(ResolverTest, MdnsGetHostByName_cnames) {
+    constexpr char v6addr[] = "::127.0.0.3";
+    constexpr char v4addr[] = "127.0.0.3";
+    constexpr char host_name[] = "hello.local.";
+    const std::vector<DnsRecord> records = {
+            {"hi.local.", ns_type::ns_t_cname, "a.local."},
+            {"a.local.", ns_type::ns_t_cname, "b.local."},
+            {"b.local.", ns_type::ns_t_cname, "c.local."},
+            {"c.local.", ns_type::ns_t_cname, "d.local."},
+            {"d.local.", ns_type::ns_t_cname, "e.local."},
+            {"e.local.", ns_type::ns_t_cname, host_name},
+            {host_name, ns_type::ns_t_a, v4addr},
+            {host_name, ns_type::ns_t_aaaa, v6addr},
+    };
+    test::DNSResponder mdnsv4("127.0.0.3", test::kDefaultMdnsListenService);
+    for (const auto& r : records) {
+        mdnsv4.addMapping(r.host_name, r.type, r.addr);
+    }
+    test::DNSResponder mdnsv6("::1", test::kDefaultMdnsListenService);
+    for (const auto& r : records) {
+        mdnsv6.addMapping(r.host_name, r.type, r.addr);
+    }
+    ASSERT_TRUE(mdnsv4.startServer());
+    ASSERT_TRUE(mdnsv6.startServer());
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+    mdnsv4.clearQueries();
+    mdnsv6.clearQueries();
+
+    static const struct TestConfig {
+        int ai_family;
+        const std::string expected_addr;
+    } testConfigs[]{
+            {AF_INET, v4addr},
+            {AF_INET6, v6addr},
+    };
+
+    for (const auto& config : testConfigs) {
+        size_t cnamecount = 0;
+        // using gethostbyname2() to resolve ipv4 hello.local. to 127.0.0.3
+        // or ipv6 hello.local. to ::127.0.0.3.
+        // Ensure the v4 address and cnames are correct
+        const hostent* result;
+        result = gethostbyname2("hi.local", config.ai_family);
+        ASSERT_FALSE(result == nullptr);
+
+        for (int i = 0; result != nullptr && result->h_aliases[i] != nullptr; i++) {
+            std::string domain_name =
+                    records[i].host_name.substr(0, records[i].host_name.size() - 1);
+            EXPECT_EQ(result->h_aliases[i], domain_name);
+            cnamecount++;
+        }
+        // The size of "Non-cname type" record in DNS records is 2
+        ASSERT_EQ(cnamecount, records.size() - 2);
+        test::DNSResponder& mdns = config.ai_family == AF_INET ? mdnsv4 : mdnsv6;
+        EXPECT_EQ(1U, mdnsv4.queries().size()) << mdns.dumpQueries();
+        int length = config.ai_family == AF_INET ? 4 : 16;
+        ASSERT_EQ(length, result->h_length);
+
+        ASSERT_FALSE(result->h_addr_list[0] == nullptr);
+        EXPECT_EQ(config.expected_addr, ToString(result));
+        EXPECT_TRUE(result->h_addr_list[1] == nullptr);
+    }
+}
+
+TEST_F(ResolverTest, MdnsGetHostByName_cnamesInfiniteLoop) {
+    constexpr char host_name1[] = "hello.local.";
+    constexpr char host_name2[] = "hi.local.";
+    const std::vector<DnsRecord> records = {
+            {host_name1, ns_type::ns_t_cname, host_name2},
+            {host_name2, ns_type::ns_t_cname, host_name1},
+    };
+
+    test::DNSResponder mdnsv4("127.0.0.3", test::kDefaultMdnsListenService);
+    test::DNSResponder mdnsv6("::1", test::kDefaultMdnsListenService);
+    for (const auto& r : records) {
+        mdnsv4.addMapping(r.host_name, r.type, r.addr);
+    }
+    for (const auto& r : records) {
+        mdnsv6.addMapping(r.host_name, r.type, r.addr);
+    }
+    ASSERT_TRUE(mdnsv4.startServer());
+    ASSERT_TRUE(mdnsv6.startServer());
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+    mdnsv4.clearQueries();
+    mdnsv6.clearQueries();
+
+    const hostent* result;
+    result = gethostbyname2("hello.local", AF_INET);
+    ASSERT_TRUE(result == nullptr);
+
+    result = gethostbyname2("hello.local", AF_INET6);
+    ASSERT_TRUE(result == nullptr);
+}
+
+TEST_F(ResolverTest, MdnsGetAddrInfo) {
+    constexpr char v6addr[] = "::127.0.0.3";
+    constexpr char v4addr[] = "127.0.0.3";
+    constexpr char host_name[] = "hello.local.";
+    test::DNSResponder mdnsv4("127.0.0.3", test::kDefaultMdnsListenService);
+    test::DNSResponder mdnsv6("::1", test::kDefaultMdnsListenService);
+    mdnsv4.addMapping(host_name, ns_type::ns_t_a, v4addr);
+    mdnsv6.addMapping(host_name, ns_type::ns_t_aaaa, v6addr);
+    ASSERT_TRUE(mdnsv4.startServer());
+    ASSERT_TRUE(mdnsv6.startServer());
+
+    std::vector<bool> keep_listening_udp_enable = {false, true};
+    for (int value : keep_listening_udp_enable) {
+        if (value == true) {
+            // Set keep_listening_udp enable
+            ScopedSystemProperties scopedSystemProperties(
+                    "persist.device_config.netd_native.keep_listening_udp", "1");
+            // Re-setup test network to make experiment flag take effect.
+            resetNetwork();
+        }
+
+        ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+        static const struct TestConfig {
+            int ai_family;
+            const std::vector<std::string> expected_addr;
+        } testConfigs[]{
+                {AF_INET, {v4addr}},
+                {AF_INET6, {v6addr}},
+                {AF_UNSPEC, {v4addr, v6addr}},
+        };
+
+        for (const auto& config : testConfigs) {
+            mdnsv4.clearQueries();
+            mdnsv6.clearQueries();
+            addrinfo hints = {.ai_family = config.ai_family, .ai_socktype = SOCK_DGRAM};
+            ScopedAddrinfo result = safe_getaddrinfo("hello.local", nullptr, &hints);
+
+            EXPECT_TRUE(result != nullptr);
+            if (config.ai_family == AF_INET) {
+                EXPECT_EQ(1U, GetNumQueries(mdnsv4, host_name));
+                mdnsv4.clearQueries();
+            } else if (config.ai_family == AF_INET6) {
+                EXPECT_EQ(1U, GetNumQueries(mdnsv6, host_name));
+                mdnsv6.clearQueries();
+            } else if (config.ai_family == AF_UNSPEC) {
+                EXPECT_EQ(1U, GetNumQueries(mdnsv4, host_name));
+                EXPECT_EQ(1U, GetNumQueries(mdnsv6, host_name));
+                mdnsv4.clearQueries();
+                mdnsv6.clearQueries();
+            }
+            std::string result_str = ToString(result);
+            EXPECT_THAT(ToStrings(result),
+                        testing::UnorderedElementsAreArray(config.expected_addr));
+
+            // Ensure the query results are still cached.
+            result = safe_getaddrinfo("hello.local", nullptr, &hints);
+            EXPECT_TRUE(result != nullptr);
+            if (config.ai_family == AF_INET)
+                EXPECT_EQ(0U, GetNumQueries(mdnsv4, host_name));
+            else if (config.ai_family == AF_INET6)
+                EXPECT_EQ(0U, GetNumQueries(mdnsv6, host_name));
+            else if (config.ai_family == AF_UNSPEC) {
+                EXPECT_EQ(0U, GetNumQueries(mdnsv4, host_name));
+                EXPECT_EQ(0U, GetNumQueries(mdnsv6, host_name));
+            }
+            result_str = ToString(result);
+            EXPECT_THAT(ToStrings(result),
+                        testing::UnorderedElementsAreArray(config.expected_addr));
+            ASSERT_TRUE(mDnsClient.resolvService()->flushNetworkCache(TEST_NETID).isOk());
+        }
+    }
+}
+
+TEST_F(ResolverTest, MdnsGetAddrInfo_InvalidSocketType) {
+    constexpr char v6addr[] = "::127.0.0.3";
+    constexpr char host_name[] = "hello.local.";
+
+    test::DNSResponder mdnsv6("::1", test::kDefaultMdnsListenService);
+    mdnsv6.addMapping(host_name, ns_type::ns_t_aaaa, v6addr);
+    ASSERT_TRUE(mdnsv6.startServer());
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+
+    // TODO: Test other invalid socket types.
+    const addrinfo hints = {
+            .ai_family = AF_UNSPEC,
+            .ai_socktype = SOCK_PACKET,
+    };
+    addrinfo* result = nullptr;
+    // This is a valid hint, but the query won't be sent because the socket type is
+    // not supported.
+    EXPECT_EQ(EAI_NODATA, getaddrinfo("howdy.local", nullptr, &hints, &result));
+    ScopedAddrinfo result_cleanup(result);
+    EXPECT_EQ(nullptr, result);
+}
+
+TEST_F(ResolverTest, MdnsGetAddrInfo_cnames) {
+    constexpr char v6addr[] = "::127.0.0.3";
+    constexpr char v4addr[] = "127.0.0.3";
+    constexpr char host_name[] = "hello.local.";
+    test::DNSResponder mdnsv4("127.0.0.3", test::kDefaultMdnsListenService);
+    test::DNSResponder mdnsv6("::1", test::kDefaultMdnsListenService);
+    const std::vector<DnsRecord> records = {
+            {"hi.local.", ns_type::ns_t_cname, "a.local."},
+            {"a.local.", ns_type::ns_t_cname, "b.local."},
+            {"b.local.", ns_type::ns_t_cname, "c.local."},
+            {"c.local.", ns_type::ns_t_cname, "d.local."},
+            {"d.local.", ns_type::ns_t_cname, "e.local."},
+            {"e.local.", ns_type::ns_t_cname, host_name},
+            {host_name, ns_type::ns_t_a, v4addr},
+            {host_name, ns_type::ns_t_aaaa, v6addr},
+    };
+    for (const auto& r : records) {
+        mdnsv4.addMapping(r.host_name, r.type, r.addr);
+    }
+    for (const auto& r : records) {
+        mdnsv6.addMapping(r.host_name, r.type, r.addr);
+    }
+    ASSERT_TRUE(mdnsv4.startServer());
+    ASSERT_TRUE(mdnsv6.startServer());
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+
+    static const struct TestConfig {
+        int ai_family;
+        const std::vector<std::string> expected_addr;
+    } testConfigs[]{
+            {AF_INET, {v4addr}},
+            {AF_INET6, {v6addr}},
+            {AF_UNSPEC, {v4addr, v6addr}},
+    };
+    for (const auto& config : testConfigs) {
+        mdnsv4.clearQueries();
+        mdnsv6.clearQueries();
+        addrinfo hints = {.ai_family = config.ai_family, .ai_socktype = SOCK_DGRAM};
+        ScopedAddrinfo result = safe_getaddrinfo("hi.local", nullptr, &hints);
+        EXPECT_TRUE(result != nullptr);
+        EXPECT_THAT(ToStrings(result), testing::UnorderedElementsAreArray(config.expected_addr));
+    }
+}
+
+TEST_F(ResolverTest, MdnsGetAddrInfo_cnamesNoIpAddress) {
+    constexpr char host_name[] = "hello.local.";
+    test::DNSResponder mdnsv4("127.0.0.3", test::kDefaultMdnsListenService);
+    test::DNSResponder mdnsv6("::1", test::kDefaultMdnsListenService);
+    mdnsv4.addMapping(host_name, ns_type::ns_t_cname, "a.local.");
+    mdnsv6.addMapping(host_name, ns_type::ns_t_cname, "a.local.");
+    ASSERT_TRUE(mdnsv4.startServer());
+    ASSERT_TRUE(mdnsv6.startServer());
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+
+    addrinfo hints = {.ai_family = AF_INET};
+    ScopedAddrinfo result = safe_getaddrinfo("hello.local", nullptr, &hints);
+    EXPECT_TRUE(result == nullptr);
+
+    mdnsv4.clearQueries();
+    hints = {.ai_family = AF_INET6};
+    result = safe_getaddrinfo("hello.local", nullptr, &hints);
+    EXPECT_TRUE(result == nullptr);
+
+    mdnsv6.clearQueries();
+    hints = {.ai_family = AF_UNSPEC};
+    result = safe_getaddrinfo("hello.local", nullptr, &hints);
+    EXPECT_TRUE(result == nullptr);
+}
+
+TEST_F(ResolverTest, MdnsGetAddrInfo_cnamesIllegalRdata) {
+    constexpr char host_name[] = "hello.local.";
+    test::DNSResponder mdnsv4("127.0.0.3", test::kDefaultMdnsListenService);
+    test::DNSResponder mdnsv6("::1", test::kDefaultMdnsListenService);
+    mdnsv4.addMapping(host_name, ns_type::ns_t_cname, ".!#?");
+    mdnsv6.addMapping(host_name, ns_type::ns_t_cname, ".!#?");
+    ASSERT_TRUE(mdnsv4.startServer());
+    ASSERT_TRUE(mdnsv6.startServer());
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+
+    addrinfo hints = {.ai_family = AF_INET};
+    ScopedAddrinfo result = safe_getaddrinfo("hello.local", nullptr, &hints);
+    EXPECT_TRUE(result == nullptr);
+
+    mdnsv4.clearQueries();
+    hints = {.ai_family = AF_INET6};
+    result = safe_getaddrinfo("hello.local", nullptr, &hints);
+    EXPECT_TRUE(result == nullptr);
+
+    mdnsv6.clearQueries();
+    hints = {.ai_family = AF_UNSPEC};
+    result = safe_getaddrinfo("hello.local", nullptr, &hints);
+    EXPECT_TRUE(result == nullptr);
+}
+
 // ResolverMultinetworkTest is used to verify multinetwork functionality. Here's how it works:
 // The resolver sends queries to address A, and then there will be a TunForwarder helping forward
 // the packets to address B, which is the address on which the testing server is listening. The
@@ -5930,8 +6456,20 @@ class ResolverMultinetworkTest : public ResolverTest {
 
       protected:
         Result<void> createNetwork() const override {
-            if (auto r = mNetdSrv->networkCreatePhysical(mNetId, INetd::PERMISSION_NONE);
-                !r.isOk()) {
+            ::ndk::ScopedAStatus r;
+            if (DnsResponderClient::isRemoteVersionSupported(mNetdSrv, 6)) {
+                const auto& config = DnsResponderClient::makeNativeNetworkConfig(
+                        mNetId, NativeNetworkType::PHYSICAL, INetd::PERMISSION_NONE,
+                        /*secure=*/false);
+                r = mNetdSrv->networkCreate(config);
+            } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                r = mNetdSrv->networkCreatePhysical(mNetId, INetd::PERMISSION_NONE);
+#pragma clang diagnostic pop
+            }
+
+            if (!r.isOk()) {
                 return Error() << r.getMessage();
             }
             return {};
@@ -5976,7 +6514,19 @@ class ResolverMultinetworkTest : public ResolverTest {
 
       protected:
         Result<void> createNetwork() const override {
-            if (auto r = mNetdSrv->networkCreateVpn(mNetId, mIsSecure); !r.isOk()) {
+            ::ndk::ScopedAStatus r;
+            if (DnsResponderClient::isRemoteVersionSupported(mNetdSrv, 6)) {
+                const auto& config = DnsResponderClient::makeNativeNetworkConfig(
+                        mNetId, NativeNetworkType::VIRTUAL, INetd::PERMISSION_NONE, mIsSecure);
+                r = mNetdSrv->networkCreate(config);
+            } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                r = mNetdSrv->networkCreateVpn(mNetId, mIsSecure);
+#pragma clang diagnostic pop
+            }
+
+            if (!r.isOk()) {
                 return Error() << r.getMessage();
             }
             return {};
