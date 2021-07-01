@@ -2414,13 +2414,16 @@ TEST_F(ResolverTest, Async_EmptyAnswer) {
         EXPECT_EQ(std::cv_status::no_timeout, cv.wait_for(lk, std::chrono::seconds(1)));
     }
 
+    ExpectDnsEvent(INetdEventListener::EVENT_RES_NSEND, 0, "howdy.example.com", {"::1.2.3.4"});
     dns.setResponseProbability(0.0);
 
     int fd2 = resNetworkQuery(TEST_NETID, "howdy.example.com", ns_c_in, ns_t_a, 0);
     EXPECT_TRUE(fd2 != -1);
+    ExpectDnsEvent(INetdEventListener::EVENT_RES_NSEND, RCODE_TIMEOUT, "howdy.example.com", {});
 
     int fd3 = resNetworkQuery(TEST_NETID, "howdy.example.com", ns_c_in, ns_t_a, 0);
     EXPECT_TRUE(fd3 != -1);
+    ExpectDnsEvent(INetdEventListener::EVENT_RES_NSEND, RCODE_TIMEOUT, "howdy.example.com", {});
 
     uint8_t buf[MAXPACKET] = {};
     int rcode;
@@ -2438,6 +2441,7 @@ TEST_F(ResolverTest, Async_EmptyAnswer) {
 
     int fd4 = resNetworkQuery(TEST_NETID, "howdy.example.com", ns_c_in, ns_t_a, 0);
     EXPECT_TRUE(fd4 != -1);
+    ExpectDnsEvent(INetdEventListener::EVENT_RES_NSEND, 0, "howdy.example.com", {"1.2.3.4"});
 
     memset(buf, 0, MAXPACKET);
     res = getAsyncResponse(fd4, &rcode, buf, MAXPACKET);
@@ -2448,12 +2452,6 @@ TEST_F(ResolverTest, Async_EmptyAnswer) {
     res = getAsyncResponse(fd1, &rcode, buf, MAXPACKET);
     EXPECT_GT(res, 0);
     EXPECT_EQ("::1.2.3.4", toString(buf, res, AF_INET6));
-
-    // Trailing dot is removed. Is it intended?
-    ExpectDnsEvent(INetdEventListener::EVENT_RES_NSEND, 0, "howdy.example.com", {"::1.2.3.4"});
-    ExpectDnsEvent(INetdEventListener::EVENT_RES_NSEND, RCODE_TIMEOUT, "howdy.example.com", {});
-    ExpectDnsEvent(INetdEventListener::EVENT_RES_NSEND, RCODE_TIMEOUT, "howdy.example.com", {});
-    ExpectDnsEvent(INetdEventListener::EVENT_RES_NSEND, 0, "howdy.example.com", {"1.2.3.4"});
 }
 
 TEST_F(ResolverTest, Async_MalformedQuery) {
@@ -4762,8 +4760,17 @@ TEST_F(ResolverTest, TlsServerRevalidation) {
         resetNetwork();
 
         // This test is sensitive to the number of queries sent in DoT validation.
-        const int latencyFactor = std::stoi(GetProperty(kDotValidationLatencyFactorFlag, "-1"));
-        const int latencyOffsetMs = std::stoi(GetProperty(kDotValidationLatencyOffsetMsFlag, "-1"));
+        int latencyFactor;
+        int latencyOffsetMs;
+        if (isAtLeastR) {
+            // The feature is enabled by default in R.
+            latencyFactor = std::stoi(GetProperty(kDotValidationLatencyFactorFlag, "3"));
+            latencyOffsetMs = std::stoi(GetProperty(kDotValidationLatencyOffsetMsFlag, "100"));
+        } else {
+            // The feature is disabled by default in Q.
+            latencyFactor = std::stoi(GetProperty(kDotValidationLatencyFactorFlag, "-1"));
+            latencyOffsetMs = std::stoi(GetProperty(kDotValidationLatencyOffsetMsFlag, "-1"));
+        }
         const bool dotValidationExtraProbes = (config.dnsMode == "OPPORTUNISTIC") &&
                                               (latencyFactor >= 0 && latencyOffsetMs >= 0 &&
                                                latencyFactor + latencyOffsetMs != 0);
@@ -5270,7 +5277,7 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
         parcel.servers = config.tlsServers;
         parcel.tlsServers = config.tlsServers;
         parcel.tlsName = config.tlsName;
-        parcel.caCertificate = config.tlsName.empty() ? "" : kCaCert;
+        parcel.caCertificate = config.tlsName.empty() ? "" : DnsResponderClient::sCaCert;
 
         const bool dnsModeChanged = (TlsNameLastTime != config.tlsName);
 
@@ -5404,7 +5411,7 @@ TEST_F(ResolverTest, RepeatedSetup_KeepChangingPrivateDnsServers) {
             parcel.servers = {config.tlsServer};
             parcel.tlsServers = {config.tlsServer};
             parcel.tlsName = config.tlsName;
-            parcel.caCertificate = config.tlsName.empty() ? "" : kCaCert;
+            parcel.caCertificate = config.tlsName.empty() ? "" : DnsResponderClient::sCaCert;
             ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
 
             if (serverState == WORKING) {
@@ -5454,7 +5461,6 @@ TEST_F(ResolverTest, RepeatedSetup_KeepChangingPrivateDnsServers) {
 
 TEST_F(ResolverTest, PermissionCheckOnCertificateInjection) {
     ResolverParamsParcel parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
-    parcel.caCertificate = kCaCert;
     ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk());
 
     for (const uid_t uid : {AID_SYSTEM, TEST_UID}) {
@@ -5966,7 +5972,6 @@ TEST_F(ResolverTest, MultipleDotQueriesInOnePacket) {
     parcel.servers = {addr};
     parcel.tlsServers = {addr};
     parcel.tlsName = kDefaultPrivateDnsHostName;
-    parcel.caCertificate = kCaCert;
     ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
     EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), true));
     EXPECT_TRUE(tls.waitForQueries(1));
