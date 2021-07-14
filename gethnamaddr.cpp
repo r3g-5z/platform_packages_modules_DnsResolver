@@ -375,7 +375,7 @@ int resolv_gethostbyname(const char* name, int af, hostent* hp, char* buf, size_
     getnamaddr info;
     ResState res(netcontext, event);
 
-    setMdnsFlag(name, &(res._flags));
+    setMdnsFlag(name, &(res.flags));
 
     size_t size;
     switch (af) {
@@ -631,7 +631,8 @@ static int dns_gethtbyname(ResState* res, const char* name, int addr_type, getna
     auto buf = std::make_unique<querybuf>();
 
     int he;
-    n = res_nsearch(res, name, C_IN, type, buf->buf, (int)sizeof(buf->buf), &he);
+    const unsigned qclass = isMdnsResolution(res->flags) ? C_IN | C_UNICAST : C_IN;
+    n = res_nsearch(res, name, qclass, type, buf->buf, (int)sizeof(buf->buf), &he);
     if (n < 0) {
         LOG(DEBUG) << __func__ << ": res_nsearch failed (" << n << ")";
         // Return h_errno (he) to catch more detailed errors rather than EAI_NODATA.
