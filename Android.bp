@@ -81,7 +81,6 @@ aidl_interface {
     backend: {
         java: {
             apex_available: [
-                "//apex_available:platform",
                 "com.android.bluetooth.updatable",
                 "com.android.tethering",
                 "com.android.wifi",
@@ -145,9 +144,6 @@ cc_defaults {
             suffix: "64",
         },
     },
-    data: [
-        ":resolv_test_keys",
-    ],
 }
 
 cc_library {
@@ -196,6 +192,7 @@ cc_library {
         "libbase",
         "libcutils",
         "libnetdutils",
+        "libdoh_ffi",
         "libprotobuf-cpp-lite",
         "libstatslog_resolv",
         "libstatspush_compat",
@@ -332,7 +329,8 @@ rust_ffi_static {
     rlibs: [
         "libandroid_logger",
         "libanyhow",
-        "liblazy_static",
+        "libbase64_rust",
+        "libfutures",
         "liblibc",
         "liblog_rust",
         "libquiche",
@@ -367,7 +365,8 @@ rust_test {
     rustlibs: [
         "libandroid_logger",
         "libanyhow",
-        "liblazy_static",
+        "libbase64_rust",
+        "libfutures",
         "liblibc",
         "liblog_rust",
         "libquiche_static",
@@ -388,7 +387,8 @@ rust_ffi_static {
     rlibs: [
         "libandroid_logger",
         "libanyhow",
-        "liblazy_static",
+        "libbase64_rust",
+        "libfutures",
         "liblibc",
         "liblog_rust",
         "libquiche_static",

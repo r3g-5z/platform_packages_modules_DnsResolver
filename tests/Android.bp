@@ -89,10 +89,7 @@ cc_test {
     // TODO: Remove the xml after MTS fixing the problem.
     test_config: "resolv_gold_test_config.xml",
     defaults: ["netd_defaults", "resolv_test_defaults"],
-    data: [
-        ":resolv_gold_test_pbtxt2pb",
-        ":resolv_test_keys",
-    ],
+    data: [":resolv_gold_test_pbtxt2pb"],
     srcs: [
         "resolv_gold_test.cpp",
     ],
@@ -106,6 +103,7 @@ cc_test {
         "dnsresolver_aidl_interface-lateststable-ndk_platform",
         "golddata_proto",
         "libcrypto_static",
+        "libdoh_ffi_for_test",
         "libgmock",
         "libnetd_resolv",
         "libnetd_test_dnsresponder_ndk",
@@ -191,9 +189,6 @@ cc_test {
         "libipchecksum",
         "resolv_unsolicited_listener",
     ],
-    data: [
-        ":resolv_test_keys",
-    ],
     // This test talks to the DnsResolver module over a binary protocol on a socket, so keep it as
     // multilib setting is worth because we might be able to get some coverage for the case where
     // 32bit apps talk to 64bit resolvers.
@@ -238,6 +233,7 @@ cc_test {
         "netd_event_listener_interface-lateststable-ndk_platform",
         "libcrypto_static",
         "libcutils",
+        "libdoh_ffi_for_test",
         "libgmock",
         "libnetd_resolv",
         "libnetd_test_dnsresponder_ndk",
@@ -301,8 +297,10 @@ cc_test {
         "libdoh_ffi_for_test",
         "libgmock",
         "liblog",
-        "libring-core",
         "libssl",
+    ],
+    shared_libs: [
+        "libnetd_client",
     ],
     min_sdk_version: "29",
 }
