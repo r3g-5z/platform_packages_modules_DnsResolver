@@ -19,7 +19,6 @@
 
 #include <android-base/logging.h>
 #include <android-base/parseint.h>
-#include <android-base/properties.h>
 #include <android-base/result.h>
 #include <android-base/stringprintf.h>
 #include <android-base/unique_fd.h>
@@ -103,6 +102,7 @@ using namespace std::chrono_literals;
 
 using aidl::android::net::IDnsResolver;
 using aidl::android::net::INetd;
+using aidl::android::net::ResolverOptionsParcel;
 using aidl::android::net::ResolverParamsParcel;
 using aidl::android::net::metrics::INetdEventListener;
 using aidl::android::net::resolv::aidl::DnsHealthEventParcel;
@@ -126,17 +126,7 @@ using android::netdutils::ScopedAddrinfo;
 using android::netdutils::Stopwatch;
 using android::netdutils::toHex;
 
-// TODO: move into libnetdutils?
 namespace {
-
-ScopedAddrinfo safe_getaddrinfo(const char* node, const char* service,
-                                const struct addrinfo* hints) {
-    addrinfo* result = nullptr;
-    if (getaddrinfo(node, service, hints, &result) != 0) {
-        result = nullptr;  // Should already be the case, but...
-    }
-    return ScopedAddrinfo(result);
-}
 
 std::pair<ScopedAddrinfo, int> safe_getaddrinfo_time_taken(const char* node, const char* service,
                                                            const addrinfo& hints) {
@@ -170,19 +160,6 @@ struct NameserverStats {
     int errors = 0;
     int timeouts = 0;
     int internal_errors = 0;
-};
-
-class ScopedSystemProperties {
-  public:
-    ScopedSystemProperties(const std::string& key, const std::string& value) : mStoredKey(key) {
-        mStoredValue = android::base::GetProperty(key, "");
-        android::base::SetProperty(key, value);
-    }
-    ~ScopedSystemProperties() { android::base::SetProperty(mStoredKey, mStoredValue); }
-
-  private:
-    std::string mStoredKey;
-    std::string mStoredValue;
 };
 
 const bool isAtLeastR = (getApiLevel() >= 30);
@@ -239,6 +216,8 @@ class ResolverTest : public ::testing::Test {
         sDnsMetricsListener->reset();
         sUnsolicitedEventListener->reset();
         SetMdnsRoute();
+        mIsResolverOptionIPCSupported =
+                DnsResponderClient::isRemoteVersionSupported(mDnsClient.resolvService(), 9);
     }
 
     void TearDown() {
@@ -465,6 +444,8 @@ class ResolverTest : public ::testing::Test {
     }
 
     DnsResponderClient mDnsClient;
+
+    bool mIsResolverOptionIPCSupported = false;
 
     // Use a shared static DNS listener for all tests to avoid registering lots of listeners
     // which may be released late until process terminated. Currently, registered DNS listener
@@ -1377,8 +1358,18 @@ TEST_F(ResolverTest, GetAddrInfoFromCustTable_InvalidInput) {
     test::DNSResponder dns;
     StartDns(dns, {});
     auto resolverParams = DnsResponderClient::GetDefaultResolverParamsParcel();
-    resolverParams.resolverOptions.hosts = invalidCustHosts;
+
+    ResolverOptionsParcel resolverOptions;
+    resolverOptions.hosts = invalidCustHosts;
+    if (!mIsResolverOptionIPCSupported) {
+        resolverParams.resolverOptions = resolverOptions;
+    }
     ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+    if (mIsResolverOptionIPCSupported) {
+        ASSERT_TRUE(mDnsClient.resolvService()
+                            ->setResolverOptions(resolverParams.netId, resolverOptions)
+                            .isOk());
+    }
     for (const auto& hostname : {hostnameNoip, hostnameInvalidip}) {
         // The query won't get data from customized table because of invalid customized table
         // and DNSResponder also has no records. hostnameNoip has never registered and
@@ -1452,8 +1443,18 @@ TEST_F(ResolverTest, GetAddrInfoFromCustTable) {
         StartDns(dns, config.dnsserverHosts);
 
         auto resolverParams = DnsResponderClient::GetDefaultResolverParamsParcel();
-        resolverParams.resolverOptions.hosts = config.customizedHosts;
+        ResolverOptionsParcel resolverOptions;
+        resolverOptions.hosts = config.customizedHosts;
+        if (!mIsResolverOptionIPCSupported) {
+            resolverParams.resolverOptions = resolverOptions;
+        }
         ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+
+        if (mIsResolverOptionIPCSupported) {
+            ASSERT_TRUE(mDnsClient.resolvService()
+                                ->setResolverOptions(resolverParams.netId, resolverOptions)
+                                .isOk());
+        }
         const addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
         ScopedAddrinfo result = safe_getaddrinfo(config.name.c_str(), nullptr, &hints);
         if (config.customizedHosts.empty() && config.dnsserverHosts.empty()) {
@@ -1488,16 +1489,34 @@ TEST_F(ResolverTest, GetAddrInfoFromCustTable_Modify) {
     StartDns(dns, dnsSvHostV4V6);
     auto resolverParams = DnsResponderClient::GetDefaultResolverParamsParcel();
 
-    resolverParams.resolverOptions.hosts = custHostV4V6;
+    ResolverOptionsParcel resolverOptions;
+    resolverOptions.hosts = custHostV4V6;
+    if (!mIsResolverOptionIPCSupported) {
+        resolverParams.resolverOptions = resolverOptions;
+    }
     ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+
+    if (mIsResolverOptionIPCSupported) {
+        ASSERT_TRUE(mDnsClient.resolvService()
+                            ->setResolverOptions(resolverParams.netId, resolverOptions)
+                            .isOk());
+    }
+
     const addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
     ScopedAddrinfo result = safe_getaddrinfo(hostnameV4V6, nullptr, &hints);
     ASSERT_TRUE(result != nullptr);
     EXPECT_THAT(ToStrings(result), testing::UnorderedElementsAreArray({custAddrV4, custAddrV6}));
     EXPECT_EQ(0U, GetNumQueries(dns, hostnameV4V6));
 
-    resolverParams.resolverOptions.hosts = {};
-    ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+    resolverOptions.hosts = {};
+    if (!mIsResolverOptionIPCSupported) {
+        resolverParams.resolverOptions = resolverOptions;
+        ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+    } else {
+        ASSERT_TRUE(mDnsClient.resolvService()
+                            ->setResolverOptions(resolverParams.netId, resolverOptions)
+                            .isOk());
+    }
     result = safe_getaddrinfo(hostnameV4V6, nullptr, &hints);
     ASSERT_TRUE(result != nullptr);
     EXPECT_THAT(ToStrings(result), testing::UnorderedElementsAreArray({dnsSvAddrV4, dnsSvAddrV6}));
@@ -4425,8 +4444,17 @@ TEST_F(ResolverTest, EnforceDnsUid) {
     }
 
     memset(buf, 0, MAXPACKET);
-    parcel.resolverOptions.enforceDnsUid = true;
-    ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk());
+    ResolverOptionsParcel resolverOptions;
+    resolverOptions.enforceDnsUid = true;
+    if (!mIsResolverOptionIPCSupported) {
+        parcel.resolverOptions = resolverOptions;
+        ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk());
+    } else {
+        ASSERT_TRUE(mDnsClient.resolvService()
+                            ->setResolverOptions(parcel.netId, resolverOptions)
+                            .isOk());
+    }
+
     {
         ScopeBlockedUIDRule scopeBlockUidRule(netdService, TEST_UID);
         // Dns Queries should NOT be blocked
@@ -5102,8 +5130,8 @@ TEST_F(ResolverTest, TruncatedRspMode) {
             // clang-format off
             {std::nullopt,                                      true,  0}, /* mode unset */
             {aidl::android::net::IDnsResolver::TC_MODE_DEFAULT, true,  0}, /* default mode */
+            {-666,                                              false, 0}, /* invalid input */
             {aidl::android::net::IDnsResolver::TC_MODE_UDP_TCP, true,  1}, /* alternative mode */
-            {-666,                                              false, 1}, /* invalid input */
             // clang-format on
     };
 
@@ -5112,10 +5140,21 @@ TEST_F(ResolverTest, TruncatedRspMode) {
 
         ResolverParamsParcel parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
         parcel.servers = {listen_addr, listen_addr2};
-        if (config.tcMode) {
-            parcel.resolverOptions.tcMode = config.tcMode.value();
+        ResolverOptionsParcel resolverOptions;
+        if (config.tcMode.has_value()) resolverOptions.tcMode = config.tcMode.value();
+        if (!mIsResolverOptionIPCSupported) {
+            parcel.resolverOptions = resolverOptions;
+            ASSERT_EQ(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk(),
+                      config.ret);
+        } else {
+            ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk());
         }
-        ASSERT_EQ(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk(), config.ret);
+        if (mIsResolverOptionIPCSupported) {
+            ASSERT_EQ(mDnsClient.resolvService()
+                              ->setResolverOptions(parcel.netId, resolverOptions)
+                              .isOk(),
+                      config.ret);
+        }
 
         const addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_DGRAM};
         ScopedAddrinfo result = safe_getaddrinfo("hello", nullptr, &hints);
@@ -5135,7 +5174,12 @@ TEST_F(ResolverTest, TruncatedRspMode) {
         // Clear the stats to make the resolver always choose the same server for the first query.
         parcel.servers.clear();
         parcel.tlsServers.clear();
-        ASSERT_EQ(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk(), config.ret);
+        if (!mIsResolverOptionIPCSupported) {
+            ASSERT_EQ(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk(),
+                      config.ret);
+        } else {
+            ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk());
+        }
     }
 }
 
