@@ -134,6 +134,7 @@ using android::net::IV_IPV6;
 using android::net::IV_UNKNOWN;
 using android::net::LinuxErrno;
 using android::net::NetworkDnsEventReported;
+using android::net::NS_T_AAAA;
 using android::net::NS_T_INVALID;
 using android::net::NsRcode;
 using android::net::NsType;
@@ -472,7 +473,7 @@ int res_nsend(ResState* statp, const uint8_t* buf, int buflen, uint8_t* ans, int
         Stopwatch queryStopwatch;
         resplen = send_mdns(statp, buffer, ans, anssiz, &terrno, rcode);
         const IPSockAddr& receivedMdnsAddr =
-                (getQueryType(buf, buflen) == T_AAAA) ? mdns_addrs[0] : mdns_addrs[1];
+                (getQueryType(buf, buflen) == NS_T_AAAA) ? mdns_addrs[0] : mdns_addrs[1];
         DnsQueryEvent* mDnsQueryEvent = addDnsQueryEvent(statp->event);
         mDnsQueryEvent->set_cache_hit(static_cast<CacheStatus>(cache_status));
         mDnsQueryEvent->set_latency_micros(saturate_cast<int32_t>(queryStopwatch.timeTakenUs()));
@@ -508,11 +509,6 @@ int res_nsend(ResState* statp, const uint8_t* buf, int buflen, uint8_t* ans, int
         return -ESRCH;
     }
 
-    // If parallel_lookup is enabled, it might be required to wait some time to avoid
-    // gateways drop packets if queries are sent too close together
-    if (sleepTimeMs != 0ms) {
-        std::this_thread::sleep_for(sleepTimeMs);
-    }
     // Private DNS
     if (!(statp->netcontext_flags & NET_CONTEXT_FLAG_USE_LOCAL_NAMESERVERS)) {
         bool fallback = false;
@@ -530,6 +526,12 @@ int res_nsend(ResState* statp, const uint8_t* buf, int buflen, uint8_t* ans, int
             _resolv_cache_query_failed(statp->netid, buf, buflen, flags);
             return -ETIMEDOUT;
         }
+    }
+
+    // If parallel_lookup is enabled, it might be required to wait some time to avoid
+    // gateways from dropping packets if queries are sent too close together.
+    if (sleepTimeMs != 0ms) {
+        std::this_thread::sleep_for(sleepTimeMs);
     }
 
     res_stats stats[MAXNS]{};
@@ -1215,7 +1217,7 @@ static int send_dg(ResState* statp, res_params* params, const uint8_t* buf, int 
 static int send_mdns(ResState* statp, std::span<const uint8_t> buf, uint8_t* ans, int anssiz,
                      int* terrno, int* rcode) {
     const sockaddr_storage ss =
-            (getQueryType(buf.data(), buf.size()) == T_AAAA) ? mdns_addrs[0] : mdns_addrs[1];
+            (getQueryType(buf.data(), buf.size()) == NS_T_AAAA) ? mdns_addrs[0] : mdns_addrs[1];
     const sockaddr* mdnsap = reinterpret_cast<const sockaddr*>(&ss);
     unique_fd fd;
 
