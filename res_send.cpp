@@ -128,12 +128,14 @@ using android::net::DnsQueryEvent;
 using android::net::DnsTlsDispatcher;
 using android::net::DnsTlsServer;
 using android::net::DnsTlsTransport;
+using android::net::Experiments;
 using android::net::IpVersion;
 using android::net::IV_IPV4;
 using android::net::IV_IPV6;
 using android::net::IV_UNKNOWN;
 using android::net::LinuxErrno;
 using android::net::NetworkDnsEventReported;
+using android::net::NS_T_AAAA;
 using android::net::NS_T_INVALID;
 using android::net::NsRcode;
 using android::net::NsType;
@@ -472,7 +474,7 @@ int res_nsend(ResState* statp, const uint8_t* buf, int buflen, uint8_t* ans, int
         Stopwatch queryStopwatch;
         resplen = send_mdns(statp, buffer, ans, anssiz, &terrno, rcode);
         const IPSockAddr& receivedMdnsAddr =
-                (getQueryType(buf, buflen) == T_AAAA) ? mdns_addrs[0] : mdns_addrs[1];
+                (getQueryType(buf, buflen) == NS_T_AAAA) ? mdns_addrs[0] : mdns_addrs[1];
         DnsQueryEvent* mDnsQueryEvent = addDnsQueryEvent(statp->event);
         mDnsQueryEvent->set_cache_hit(static_cast<CacheStatus>(cache_status));
         mDnsQueryEvent->set_latency_micros(saturate_cast<int32_t>(queryStopwatch.timeTakenUs()));
@@ -508,14 +510,8 @@ int res_nsend(ResState* statp, const uint8_t* buf, int buflen, uint8_t* ans, int
         return -ESRCH;
     }
 
-    // If parallel_lookup is enabled, it might be required to wait some time to avoid
-    // gateways drop packets if queries are sent too close together
-    if (sleepTimeMs != 0ms) {
-        std::this_thread::sleep_for(sleepTimeMs);
-    }
     // Private DNS
-    if (!(statp->netcontext_flags & NET_CONTEXT_FLAG_USE_LOCAL_NAMESERVERS) &&
-        !isMdnsResolution(statp->flags)) {
+    if (!(statp->netcontext_flags & NET_CONTEXT_FLAG_USE_LOCAL_NAMESERVERS)) {
         bool fallback = false;
         int resplen = res_private_dns_send(statp, Slice(const_cast<uint8_t*>(buf), buflen),
                                            Slice(ans, anssiz), rcode, &fallback);
@@ -531,6 +527,12 @@ int res_nsend(ResState* statp, const uint8_t* buf, int buflen, uint8_t* ans, int
             _resolv_cache_query_failed(statp->netid, buf, buflen, flags);
             return -ETIMEDOUT;
         }
+    }
+
+    // If parallel_lookup is enabled, it might be required to wait some time to avoid
+    // gateways from dropping packets if queries are sent too close together.
+    if (sleepTimeMs != 0ms) {
+        std::this_thread::sleep_for(sleepTimeMs);
     }
 
     res_stats stats[MAXNS]{};
@@ -1216,7 +1218,7 @@ static int send_dg(ResState* statp, res_params* params, const uint8_t* buf, int 
 static int send_mdns(ResState* statp, std::span<const uint8_t> buf, uint8_t* ans, int anssiz,
                      int* terrno, int* rcode) {
     const sockaddr_storage ss =
-            (getQueryType(buf.data(), buf.size()) == T_AAAA) ? mdns_addrs[0] : mdns_addrs[1];
+            (getQueryType(buf.data(), buf.size()) == NS_T_AAAA) ? mdns_addrs[0] : mdns_addrs[1];
     const sockaddr* mdnsap = reinterpret_cast<const sockaddr*>(&ss);
     unique_fd fd;
 
@@ -1392,7 +1394,12 @@ ssize_t res_doh_send(ResState* statp, const Slice query, const Slice answer, int
     const unsigned netId = statp->netid;
     LOG(INFO) << __func__ << ": performing query over Https";
     Stopwatch queryStopwatch;
-    ssize_t result = privateDnsConfiguration.dohQuery(netId, query, answer, /*timeoutMs*/ 2000);
+    int queryTimeout = Experiments::getInstance()->getFlag(
+            "doh_query_timeout_ms", PrivateDnsConfiguration::kDohQueryDefaultTimeoutMs);
+    if (queryTimeout < 1000) {
+        queryTimeout = 1000;
+    }
+    ssize_t result = privateDnsConfiguration.dohQuery(netId, query, answer, queryTimeout);
     LOG(INFO) << __func__ << ": Https query result: " << result;
 
     if (result == RESULT_CAN_NOT_SEND) return RESULT_CAN_NOT_SEND;

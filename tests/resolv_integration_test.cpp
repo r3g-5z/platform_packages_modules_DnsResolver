@@ -19,7 +19,6 @@
 
 #include <android-base/logging.h>
 #include <android-base/parseint.h>
-#include <android-base/properties.h>
 #include <android-base/result.h>
 #include <android-base/stringprintf.h>
 #include <android-base/unique_fd.h>
@@ -103,6 +102,7 @@ using namespace std::chrono_literals;
 
 using aidl::android::net::IDnsResolver;
 using aidl::android::net::INetd;
+using aidl::android::net::ResolverOptionsParcel;
 using aidl::android::net::ResolverParamsParcel;
 using aidl::android::net::metrics::INetdEventListener;
 using aidl::android::net::resolv::aidl::DnsHealthEventParcel;
@@ -126,17 +126,7 @@ using android::netdutils::ScopedAddrinfo;
 using android::netdutils::Stopwatch;
 using android::netdutils::toHex;
 
-// TODO: move into libnetdutils?
 namespace {
-
-ScopedAddrinfo safe_getaddrinfo(const char* node, const char* service,
-                                const struct addrinfo* hints) {
-    addrinfo* result = nullptr;
-    if (getaddrinfo(node, service, hints, &result) != 0) {
-        result = nullptr;  // Should already be the case, but...
-    }
-    return ScopedAddrinfo(result);
-}
 
 std::pair<ScopedAddrinfo, int> safe_getaddrinfo_time_taken(const char* node, const char* service,
                                                            const addrinfo& hints) {
@@ -170,19 +160,6 @@ struct NameserverStats {
     int errors = 0;
     int timeouts = 0;
     int internal_errors = 0;
-};
-
-class ScopedSystemProperties {
-  public:
-    ScopedSystemProperties(const std::string& key, const std::string& value) : mStoredKey(key) {
-        mStoredValue = android::base::GetProperty(key, "");
-        android::base::SetProperty(key, value);
-    }
-    ~ScopedSystemProperties() { android::base::SetProperty(mStoredKey, mStoredValue); }
-
-  private:
-    std::string mStoredKey;
-    std::string mStoredValue;
 };
 
 const bool isAtLeastR = (getApiLevel() >= 30);
@@ -239,6 +216,8 @@ class ResolverTest : public ::testing::Test {
         sDnsMetricsListener->reset();
         sUnsolicitedEventListener->reset();
         SetMdnsRoute();
+        mIsResolverOptionIPCSupported =
+                DnsResponderClient::isRemoteVersionSupported(mDnsClient.resolvService(), 9);
     }
 
     void TearDown() {
@@ -465,6 +444,8 @@ class ResolverTest : public ::testing::Test {
     }
 
     DnsResponderClient mDnsClient;
+
+    bool mIsResolverOptionIPCSupported = false;
 
     // Use a shared static DNS listener for all tests to avoid registering lots of listeners
     // which may be released late until process terminated. Currently, registered DNS listener
@@ -1377,8 +1358,18 @@ TEST_F(ResolverTest, GetAddrInfoFromCustTable_InvalidInput) {
     test::DNSResponder dns;
     StartDns(dns, {});
     auto resolverParams = DnsResponderClient::GetDefaultResolverParamsParcel();
-    resolverParams.resolverOptions.hosts = invalidCustHosts;
+
+    ResolverOptionsParcel resolverOptions;
+    resolverOptions.hosts = invalidCustHosts;
+    if (!mIsResolverOptionIPCSupported) {
+        resolverParams.resolverOptions = resolverOptions;
+    }
     ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+    if (mIsResolverOptionIPCSupported) {
+        ASSERT_TRUE(mDnsClient.resolvService()
+                            ->setResolverOptions(resolverParams.netId, resolverOptions)
+                            .isOk());
+    }
     for (const auto& hostname : {hostnameNoip, hostnameInvalidip}) {
         // The query won't get data from customized table because of invalid customized table
         // and DNSResponder also has no records. hostnameNoip has never registered and
@@ -1452,8 +1443,18 @@ TEST_F(ResolverTest, GetAddrInfoFromCustTable) {
         StartDns(dns, config.dnsserverHosts);
 
         auto resolverParams = DnsResponderClient::GetDefaultResolverParamsParcel();
-        resolverParams.resolverOptions.hosts = config.customizedHosts;
+        ResolverOptionsParcel resolverOptions;
+        resolverOptions.hosts = config.customizedHosts;
+        if (!mIsResolverOptionIPCSupported) {
+            resolverParams.resolverOptions = resolverOptions;
+        }
         ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+
+        if (mIsResolverOptionIPCSupported) {
+            ASSERT_TRUE(mDnsClient.resolvService()
+                                ->setResolverOptions(resolverParams.netId, resolverOptions)
+                                .isOk());
+        }
         const addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
         ScopedAddrinfo result = safe_getaddrinfo(config.name.c_str(), nullptr, &hints);
         if (config.customizedHosts.empty() && config.dnsserverHosts.empty()) {
@@ -1488,16 +1489,34 @@ TEST_F(ResolverTest, GetAddrInfoFromCustTable_Modify) {
     StartDns(dns, dnsSvHostV4V6);
     auto resolverParams = DnsResponderClient::GetDefaultResolverParamsParcel();
 
-    resolverParams.resolverOptions.hosts = custHostV4V6;
+    ResolverOptionsParcel resolverOptions;
+    resolverOptions.hosts = custHostV4V6;
+    if (!mIsResolverOptionIPCSupported) {
+        resolverParams.resolverOptions = resolverOptions;
+    }
     ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+
+    if (mIsResolverOptionIPCSupported) {
+        ASSERT_TRUE(mDnsClient.resolvService()
+                            ->setResolverOptions(resolverParams.netId, resolverOptions)
+                            .isOk());
+    }
+
     const addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
     ScopedAddrinfo result = safe_getaddrinfo(hostnameV4V6, nullptr, &hints);
     ASSERT_TRUE(result != nullptr);
     EXPECT_THAT(ToStrings(result), testing::UnorderedElementsAreArray({custAddrV4, custAddrV6}));
     EXPECT_EQ(0U, GetNumQueries(dns, hostnameV4V6));
 
-    resolverParams.resolverOptions.hosts = {};
-    ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+    resolverOptions.hosts = {};
+    if (!mIsResolverOptionIPCSupported) {
+        resolverParams.resolverOptions = resolverOptions;
+        ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+    } else {
+        ASSERT_TRUE(mDnsClient.resolvService()
+                            ->setResolverOptions(resolverParams.netId, resolverOptions)
+                            .isOk());
+    }
     result = safe_getaddrinfo(hostnameV4V6, nullptr, &hints);
     ASSERT_TRUE(result != nullptr);
     EXPECT_THAT(ToStrings(result), testing::UnorderedElementsAreArray({dnsSvAddrV4, dnsSvAddrV6}));
@@ -4425,8 +4444,17 @@ TEST_F(ResolverTest, EnforceDnsUid) {
     }
 
     memset(buf, 0, MAXPACKET);
-    parcel.resolverOptions.enforceDnsUid = true;
-    ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk());
+    ResolverOptionsParcel resolverOptions;
+    resolverOptions.enforceDnsUid = true;
+    if (!mIsResolverOptionIPCSupported) {
+        parcel.resolverOptions = resolverOptions;
+        ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk());
+    } else {
+        ASSERT_TRUE(mDnsClient.resolvService()
+                            ->setResolverOptions(parcel.netId, resolverOptions)
+                            .isOk());
+    }
+
     {
         ScopeBlockedUIDRule scopeBlockUidRule(netdService, TEST_UID);
         // Dns Queries should NOT be blocked
@@ -5102,8 +5130,8 @@ TEST_F(ResolverTest, TruncatedRspMode) {
             // clang-format off
             {std::nullopt,                                      true,  0}, /* mode unset */
             {aidl::android::net::IDnsResolver::TC_MODE_DEFAULT, true,  0}, /* default mode */
+            {-666,                                              false, 0}, /* invalid input */
             {aidl::android::net::IDnsResolver::TC_MODE_UDP_TCP, true,  1}, /* alternative mode */
-            {-666,                                              false, 1}, /* invalid input */
             // clang-format on
     };
 
@@ -5112,10 +5140,21 @@ TEST_F(ResolverTest, TruncatedRspMode) {
 
         ResolverParamsParcel parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
         parcel.servers = {listen_addr, listen_addr2};
-        if (config.tcMode) {
-            parcel.resolverOptions.tcMode = config.tcMode.value();
+        ResolverOptionsParcel resolverOptions;
+        if (config.tcMode.has_value()) resolverOptions.tcMode = config.tcMode.value();
+        if (!mIsResolverOptionIPCSupported) {
+            parcel.resolverOptions = resolverOptions;
+            ASSERT_EQ(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk(),
+                      config.ret);
+        } else {
+            ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk());
         }
-        ASSERT_EQ(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk(), config.ret);
+        if (mIsResolverOptionIPCSupported) {
+            ASSERT_EQ(mDnsClient.resolvService()
+                              ->setResolverOptions(parcel.netId, resolverOptions)
+                              .isOk(),
+                      config.ret);
+        }
 
         const addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_DGRAM};
         ScopedAddrinfo result = safe_getaddrinfo("hello", nullptr, &hints);
@@ -5135,7 +5174,12 @@ TEST_F(ResolverTest, TruncatedRspMode) {
         // Clear the stats to make the resolver always choose the same server for the first query.
         parcel.servers.clear();
         parcel.tlsServers.clear();
-        ASSERT_EQ(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk(), config.ret);
+        if (!mIsResolverOptionIPCSupported) {
+            ASSERT_EQ(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk(),
+                      config.ret);
+        } else {
+            ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk());
+        }
     }
 }
 
@@ -6427,6 +6471,14 @@ class ResolverMultinetworkTest : public ResolverTest {
         bool clearDnsConfiguration() const;
         unsigned netId() const { return mNetId; }
         std::string name() const { return mNetworkName; }
+        Result<void> addUser(uid_t uid) const { return addUidRange(uid, uid); }
+        Result<void> addUidRange(uid_t from, uid_t to) const {
+            if (auto r = mNetdSrv->networkAddUidRanges(mNetId, {makeUidRangeParcel(from, to)});
+                !r.isOk()) {
+                return Error() << r.getMessage();
+            }
+            return {};
+        }
 
       protected:
         // Subclasses should implement it to decide which network should be create.
@@ -6510,14 +6562,6 @@ class ResolverMultinetworkTest : public ResolverTest {
             mVpnIsolationUids.erase(uid);
             return {};
         }
-        Result<void> addUser(uid_t uid) const { return addUidRange(uid, uid); }
-        Result<void> addUidRange(uid_t from, uid_t to) const {
-            if (auto r = mNetdSrv->networkAddUidRanges(mNetId, {makeUidRangeParcel(from, to)});
-                !r.isOk()) {
-                return Error() << r.getMessage();
-            }
-            return {};
-        }
 
       protected:
         Result<void> createNetwork() const override {
@@ -6577,6 +6621,17 @@ class ResolverMultinetworkTest : public ResolverTest {
     unsigned getFreeNetId() {
         if (mNextNetId == TEST_NETID_BASE + 256) mNextNetId = TEST_NETID_BASE;
         return mNextNetId++;
+    }
+    Result<std::shared_ptr<test::DNSResponder>> setupDns(ConnectivityType type, ScopedNetwork* nw,
+                                                         const char* host_name,
+                                                         const char* ipv4_addr,
+                                                         const char* ipv6_addr);
+
+    void expectDnsQueryCountsFn(std::shared_ptr<test::DNSResponder> dnsServer,
+                                const char* host_name, size_t count, unsigned expectedDnsNetId) {
+        EXPECT_EQ(GetNumQueries(*dnsServer, host_name), count);
+        EXPECT_TRUE(mDnsClient.resolvService()->flushNetworkCache(expectedDnsNetId).isOk());
+        dnsServer->clearQueries();
     }
 
   private:
@@ -6641,6 +6696,21 @@ void ResolverMultinetworkTest::StartDns(test::DNSResponder& dns,
         setNetworkForSocket(netId.value(), dns.getUdpSocket());
         setNetworkForSocket(netId.value(), dns.getTcpSocket());
     }
+}
+
+Result<std::shared_ptr<test::DNSResponder>> ResolverMultinetworkTest::setupDns(
+        ConnectivityType type, ScopedNetwork* nw, const char* host_name, const char* ipv4_addr,
+        const char* ipv6_addr) {
+    // Add a testing DNS server to networks.
+    const Result<DnsServerPair> dnsSvPair =
+            (type == ConnectivityType::V4) ? nw->addIpv4Dns() : nw->addIpv6Dns();
+    if (!dnsSvPair.ok()) return Error() << dnsSvPair.error();
+
+    StartDns(*dnsSvPair->dnsServer,
+             {{host_name, ns_type::ns_t_a, ipv4_addr}, {host_name, ns_type::ns_t_aaaa, ipv6_addr}});
+    if (!nw->setDnsConfiguration()) return Error() << "setDnsConfiguration() failed";
+    if (!nw->startTunForwarder()) return Error() << "startTunForwarder() failed";
+    return dnsSvPair->dnsServer;
 }
 
 Result<ResolverMultinetworkTest::DnsServerPair> ResolverMultinetworkTest::ScopedNetwork::addDns(
@@ -6875,30 +6945,15 @@ TEST_F(ResolverMultinetworkTest, DnsWithVpn) {
         ASSERT_RESULT_OK(bypassableVpnNetwork.addUser(TEST_UID));
         ASSERT_RESULT_OK(secureVpnNetwork.addUser(TEST_UID2));
 
-        auto setupDnsFn = [&](std::shared_ptr<test::DNSResponder> dnsServer,
-                              ScopedNetwork* nw) -> void {
-            StartDns(*dnsServer, {{host_name, ns_type::ns_t_a, ipv4_addr},
-                                  {host_name, ns_type::ns_t_aaaa, ipv6_addr}});
-            ASSERT_TRUE(nw->setDnsConfiguration());
-            ASSERT_TRUE(nw->startTunForwarder());
-        };
-        // Add a testing DNS server to networks.
-        const Result<DnsServerPair> underlyingPair = (type == ConnectivityType::V4)
-                                                             ? underlyingNetwork.addIpv4Dns()
-                                                             : underlyingNetwork.addIpv6Dns();
-        ASSERT_RESULT_OK(underlyingPair);
-        const Result<DnsServerPair> bypassableVpnPair = (type == ConnectivityType::V4)
-                                                                ? bypassableVpnNetwork.addIpv4Dns()
-                                                                : bypassableVpnNetwork.addIpv6Dns();
-        ASSERT_RESULT_OK(bypassableVpnPair);
-        const Result<DnsServerPair> secureVpnPair = (type == ConnectivityType::V4)
-                                                            ? secureVpnNetwork.addIpv4Dns()
-                                                            : secureVpnNetwork.addIpv6Dns();
-        ASSERT_RESULT_OK(secureVpnPair);
         // Set up resolver and start forwarding for networks.
-        setupDnsFn(underlyingPair->dnsServer, &underlyingNetwork);
-        setupDnsFn(bypassableVpnPair->dnsServer, &bypassableVpnNetwork);
-        setupDnsFn(secureVpnPair->dnsServer, &secureVpnNetwork);
+        auto underlyingNwDnsSv =
+                setupDns(type, &underlyingNetwork, host_name, ipv4_addr, ipv6_addr);
+        ASSERT_RESULT_OK(underlyingNwDnsSv);
+        auto bypassableVpnDnsSv =
+                setupDns(type, &bypassableVpnNetwork, host_name, ipv4_addr, ipv6_addr);
+        ASSERT_RESULT_OK(bypassableVpnDnsSv);
+        auto secureVpnDnsSv = setupDns(type, &secureVpnNetwork, host_name, ipv4_addr, ipv6_addr);
+        ASSERT_RESULT_OK(secureVpnDnsSv);
 
         setDefaultNetwork(underlyingNetwork.netId());
         const unsigned underlyingNetId = underlyingNetwork.netId();
@@ -6906,15 +6961,6 @@ TEST_F(ResolverMultinetworkTest, DnsWithVpn) {
         const unsigned secureVpnNetId = secureVpnNetwork.netId();
         // We've called setNetworkForProcess in SetupOemNetwork, so reset to default first.
         ScopedSetNetworkForProcess scopedSetNetworkForProcess(NETID_UNSET);
-        auto expectDnsQueryCountsFn = [&](size_t count,
-                                          std::shared_ptr<test::DNSResponder> dnsServer,
-                                          unsigned expectedDnsNetId) -> void {
-            EXPECT_EQ(GetNumQueries(*dnsServer, host_name), count);
-            EXPECT_TRUE(mDnsClient.resolvService()->flushNetworkCache(expectedDnsNetId).isOk());
-            dnsServer->clearQueries();
-            // Give DnsResolver some time to clear cache to avoid race.
-            usleep(5 * 1000);
-        };
 
         // Create a object to represent default network, do not init it.
         ScopedPhysicalNetwork defaultNetwork{NETID_UNSET, "Default"};
@@ -6928,20 +6974,20 @@ TEST_F(ResolverMultinetworkTest, DnsWithVpn) {
         } vpnWithDnsServerConfigs[]{
                 // clang-format off
                 // Queries use the bypassable VPN by default.
-                {&defaultNetwork,       bypassableVpnNetId, bypassableVpnPair->dnsServer},
+                {&defaultNetwork,       bypassableVpnNetId, *bypassableVpnDnsSv},
                 // Choosing the underlying network works because the VPN is bypassable.
-                {&underlyingNetwork,    underlyingNetId,    underlyingPair->dnsServer},
+                {&underlyingNetwork,    underlyingNetId,    *underlyingNwDnsSv},
                 // Selecting the VPN sends the query on the VPN.
-                {&bypassableVpnNetwork, bypassableVpnNetId, bypassableVpnPair->dnsServer},
+                {&bypassableVpnNetwork, bypassableVpnNetId, *bypassableVpnDnsSv},
                 // TEST_UID does not have access to the secure VPN.
-                {&secureVpnNetwork,     bypassableVpnNetId, bypassableVpnPair->dnsServer},
+                {&secureVpnNetwork,     bypassableVpnNetId, *bypassableVpnDnsSv},
                 // clang-format on
         };
         for (const auto& config : vpnWithDnsServerConfigs) {
             SCOPED_TRACE(fmt::format("Bypassble VPN with DnsServer, selectedNetwork = {}",
                                      config.selectedNetwork->name()));
             expectDnsWorksForUid(host_name, config.selectedNetwork->netId(), TEST_UID, result);
-            expectDnsQueryCountsFn(result.size(), config.expectedDnsServer,
+            expectDnsQueryCountsFn(config.expectedDnsServer, host_name, result.size(),
                                    config.expectedDnsNetId);
         }
 
@@ -6954,7 +7000,7 @@ TEST_F(ResolverMultinetworkTest, DnsWithVpn) {
             SCOPED_TRACE(fmt::format("Bypassble VPN without DnsServer, selectedNetwork = {}",
                                      selectedNetwork->name()));
             expectDnsWorksForUid(host_name, selectedNetwork->netId(), TEST_UID, result);
-            expectDnsQueryCountsFn(result.size(), underlyingPair->dnsServer, underlyingNetId);
+            expectDnsQueryCountsFn(*underlyingNwDnsSv, host_name, result.size(), underlyingNetId);
         }
 
         // The same test scenario as before plus enableVpnIsolation for secure VPN, TEST_UID2.
@@ -6970,7 +7016,8 @@ TEST_F(ResolverMultinetworkTest, DnsWithVpn) {
                 SCOPED_TRACE(fmt::format("Secure VPN without DnsServer, selectedNetwork = {}",
                                          selectedNetwork->name()));
                 expectDnsWorksForUid(host_name, selectedNetwork->netId(), TEST_UID2, result);
-                expectDnsQueryCountsFn(result.size(), underlyingPair->dnsServer, underlyingNetId);
+                expectDnsQueryCountsFn(*underlyingNwDnsSv, host_name, result.size(),
+                                       underlyingNetId);
             }
 
             // Test secure VPN with DNS server.
@@ -6979,12 +7026,111 @@ TEST_F(ResolverMultinetworkTest, DnsWithVpn) {
                 SCOPED_TRACE(fmt::format("Secure VPN with DnsServer, selectedNetwork = {}",
                                          selectedNetwork->name()));
                 expectDnsWorksForUid(host_name, selectedNetwork->netId(), TEST_UID2, result);
-                expectDnsQueryCountsFn(result.size(), secureVpnPair->dnsServer, secureVpnNetId);
+                expectDnsQueryCountsFn(*secureVpnDnsSv, host_name, result.size(), secureVpnNetId);
             }
 
             if (enableVpnIsolation) {
                 EXPECT_RESULT_OK(secureVpnNetwork.disableVpnIsolation(TEST_UID2));
             }
         }
+    }
+}
+
+// verify per-application default network selection on DNS.
+TEST_F(ResolverMultinetworkTest, PerAppDefaultNetwork) {
+    // Netd supports uid ranges on physical network from v6.
+    SKIP_IF_REMOTE_VERSION_LESS_THAN(mDnsClient.netdService(), 6);
+
+    constexpr char host_name[] = "ohayou.example.com.";
+    constexpr char ipv4_addr[] = "192.0.2.0";
+    constexpr char ipv6_addr[] = "2001:db8:cafe:d00d::31";
+
+    const std::pair<ConnectivityType, std::vector<std::string>> testPairs[] = {
+            {ConnectivityType::V4, {ipv4_addr}},
+            {ConnectivityType::V6, {ipv6_addr}},
+            {ConnectivityType::V4V6, {ipv6_addr, ipv4_addr}},
+    };
+    for (const auto& [ipVersion, expectedDnsReply] : testPairs) {
+        SCOPED_TRACE(StringPrintf("ConnectivityType: %d", ipVersion));
+
+        // Create networks.
+        ScopedPhysicalNetwork sysDefaultNetwork =
+                CreateScopedPhysicalNetwork(ipVersion, "SysDefault");
+        ScopedPhysicalNetwork appDefaultNetwork =
+                CreateScopedPhysicalNetwork(ipVersion, "AppDefault");
+        ScopedVirtualNetwork vpn = CreateScopedVirtualNetwork(ipVersion, false, "Vpn");
+
+        ASSERT_RESULT_OK(sysDefaultNetwork.init());
+        ASSERT_RESULT_OK(appDefaultNetwork.init());
+        ASSERT_RESULT_OK(vpn.init());
+
+        // Set up resolver and start forwarding for networks.
+        auto sysDefaultNwDnsSv =
+                setupDns(ipVersion, &sysDefaultNetwork, host_name, ipv4_addr, ipv6_addr);
+        ASSERT_RESULT_OK(sysDefaultNwDnsSv);
+        auto appDefaultNwDnsSv =
+                setupDns(ipVersion, &appDefaultNetwork, host_name, ipv4_addr, ipv6_addr);
+        ASSERT_RESULT_OK(appDefaultNwDnsSv);
+        auto vpnDnsSv = setupDns(ipVersion, &vpn, host_name, ipv4_addr, ipv6_addr);
+        ASSERT_RESULT_OK(vpnDnsSv);
+
+        const unsigned systemDefaultNetId = sysDefaultNetwork.netId();
+        const unsigned appDefaultNetId = appDefaultNetwork.netId();
+        const unsigned vpnNetId = vpn.netId();
+
+        setDefaultNetwork(systemDefaultNetId);
+        EXPECT_TRUE(
+                mDnsClient.netdService()
+                        ->networkSetPermissionForNetwork(appDefaultNetId, INetd::PERMISSION_SYSTEM)
+                        .isOk());
+
+        // We've called setNetworkForProcess in SetupOemNetwork, reset to default first.
+        ScopedSetNetworkForProcess scopedSetNetworkForProcess(NETID_UNSET);
+
+        // Test DNS query without selecting a network. --> use system default network.
+        expectDnsWorksForUid(host_name, NETID_UNSET, TEST_UID, expectedDnsReply);
+        expectDnsQueryCountsFn(*sysDefaultNwDnsSv, host_name, expectedDnsReply.size(),
+                               systemDefaultNetId);
+        // Add user to app default network. --> use app default network.
+        ASSERT_RESULT_OK(appDefaultNetwork.addUser(TEST_UID));
+        expectDnsWorksForUid(host_name, NETID_UNSET, TEST_UID, expectedDnsReply);
+        expectDnsQueryCountsFn(*appDefaultNwDnsSv, host_name, expectedDnsReply.size(),
+                               appDefaultNetId);
+
+        // Test DNS query with a selected network.
+        // App default network applies to uid, vpn does not applies to uid.
+        const struct TestConfig {
+            ScopedNetwork* selectedNetwork;
+            unsigned expectedDnsNetId;
+            std::shared_ptr<test::DNSResponder> expectedDnsServer;
+        } vpnWithDnsServerConfigs[]{
+                // clang-format off
+                // App can select the system default network without any permission.
+                {&sysDefaultNetwork, systemDefaultNetId, *sysDefaultNwDnsSv},
+                // App can select the restricted network, since its uid was assigned to the network.
+                {&appDefaultNetwork, appDefaultNetId, *appDefaultNwDnsSv},
+                // App does not have access to the VPN. --> fallback to app default network.
+                {&vpn, appDefaultNetId, *appDefaultNwDnsSv},
+                // clang-format on
+        };
+        for (const auto& config : vpnWithDnsServerConfigs) {
+            SCOPED_TRACE(fmt::format("Dns over app default network, selectedNetwork = {}",
+                                     config.selectedNetwork->name()));
+            expectDnsWorksForUid(host_name, config.selectedNetwork->netId(), TEST_UID,
+                                 expectedDnsReply);
+            expectDnsQueryCountsFn(config.expectedDnsServer, host_name, expectedDnsReply.size(),
+                                   config.expectedDnsNetId);
+        }
+
+        // App default network applies to uid, vpn applies to uid. --> use vpn.
+        ASSERT_RESULT_OK(vpn.addUser(TEST_UID));
+        expectDnsWorksForUid(host_name, vpn.netId(), TEST_UID, expectedDnsReply);
+        expectDnsQueryCountsFn(*vpnDnsSv, host_name, expectedDnsReply.size(), vpnNetId);
+
+        // vpn without server. --> fallback to app default network.
+        ASSERT_TRUE(vpn.clearDnsConfiguration());
+        expectDnsWorksForUid(host_name, vpn.netId(), TEST_UID, expectedDnsReply);
+        expectDnsQueryCountsFn(*appDefaultNwDnsSv, host_name, expectedDnsReply.size(),
+                               appDefaultNetId);
     }
 }
