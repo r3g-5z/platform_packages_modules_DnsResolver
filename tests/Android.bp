@@ -20,7 +20,7 @@ cc_test_library {
         "libutils",
     ],
     static_libs: [
-        "netd_aidl_interface-lateststable-ndk_platform",
+        "netd_aidl_interface-lateststable-ndk",
         "libnetd_test_dnsresponder_ndk",
         "libnetdutils",
         "libgmock",
@@ -89,10 +89,7 @@ cc_test {
     // TODO: Remove the xml after MTS fixing the problem.
     test_config: "resolv_gold_test_config.xml",
     defaults: ["netd_defaults", "resolv_test_defaults"],
-    data: [
-        ":resolv_gold_test_pbtxt2pb",
-        ":resolv_test_keys",
-    ],
+    data: [":resolv_gold_test_pbtxt2pb"],
     srcs: [
         "resolv_gold_test.cpp",
     ],
@@ -103,9 +100,10 @@ cc_test {
         "libbinder_ndk",
     ],
     static_libs: [
-        "dnsresolver_aidl_interface-lateststable-ndk_platform",
+        "dnsresolver_aidl_interface-lateststable-ndk",
         "golddata_proto",
         "libcrypto_static",
+        "libdoh_ffi_for_test",
         "libgmock",
         "libnetd_resolv",
         "libnetd_test_dnsresponder_ndk",
@@ -113,8 +111,8 @@ cc_test {
         "libnetdutils",
         "libprotobuf-cpp-lite",
         "libssl",
-        "netd_aidl_interface-lateststable-ndk_platform",
-        "netd_event_listener_interface-lateststable-ndk_platform",
+        "netd_aidl_interface-lateststable-ndk",
+        "netd_event_listener_interface-lateststable-ndk",
         "server_configurable_flags",
         "stats_proto",
     ],
@@ -141,14 +139,14 @@ cc_test {
         "libnetd_client",
     ],
     static_libs: [
-        "dnsresolver_aidl_interface-lateststable-ndk_platform",
+        "dnsresolver_aidl_interface-lateststable-ndk",
         "libgmock",
         "libnetd_test_dnsresponder_ndk",
         "libnetd_test_resolv_utils",
         "libnetdutils",
         "libutils",
-        "netd_event_listener_interface-lateststable-ndk_platform",
-        "netd_aidl_interface-lateststable-ndk_platform",
+        "netd_event_listener_interface-lateststable-ndk",
+        "netd_aidl_interface-lateststable-ndk",
     ],
 }
 
@@ -162,7 +160,9 @@ cc_test {
     srcs: [
         "dns_responder/dns_responder.cpp",
         "dnsresolver_binder_test.cpp",
+        "doh_frontend.cpp",
         "resolv_integration_test.cpp",
+        "resolv_private_dns_test.cpp",
         "tun_forwarder.cpp",
     ],
     header_libs: [
@@ -176,7 +176,7 @@ cc_test {
         "libnetd_client",
     ],
     static_libs: [
-        "dnsresolver_aidl_interface-lateststable-ndk_platform",
+        "dnsresolver_aidl_interface-lateststable-ndk",
         "libbpf_android",
         "libcrypto_static",
         "libgmock",
@@ -186,13 +186,11 @@ cc_test {
         "libnetdutils",
         "libssl",
         "libutils",
-        "netd_aidl_interface-lateststable-ndk_platform",
-        "netd_event_listener_interface-lateststable-ndk_platform",
+        "netd_aidl_interface-lateststable-ndk",
+        "netd_event_listener_interface-lateststable-ndk",
         "libipchecksum",
         "resolv_unsolicited_listener",
-    ],
-    data: [
-        ":resolv_test_keys",
+        "libdoh_frontend_ffi",
     ],
     // This test talks to the DnsResolver module over a binary protocol on a socket, so keep it as
     // multilib setting is worth because we might be able to get some coverage for the case where
@@ -233,11 +231,12 @@ cc_test {
         "libbinder_ndk",
     ],
     static_libs: [
-        "dnsresolver_aidl_interface-lateststable-ndk_platform",
-        "netd_aidl_interface-lateststable-ndk_platform",
-        "netd_event_listener_interface-lateststable-ndk_platform",
+        "dnsresolver_aidl_interface-lateststable-ndk",
+        "netd_aidl_interface-lateststable-ndk",
+        "netd_event_listener_interface-lateststable-ndk",
         "libcrypto_static",
         "libcutils",
+        "libdoh_ffi_for_test",
         "libgmock",
         "libnetd_resolv",
         "libnetd_test_dnsresponder_ndk",
@@ -304,8 +303,10 @@ cc_test {
         "libdoh_ffi_for_test",
         "libgmock",
         "liblog",
-        "libring-core",
         "libssl",
+    ],
+    shared_libs: [
+        "libnetd_client",
     ],
     min_sdk_version: "29",
 }
