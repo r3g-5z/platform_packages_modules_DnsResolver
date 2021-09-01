@@ -52,7 +52,6 @@
 #include <aidl/android/net/IDnsResolver.h>
 #include <android-base/logging.h>
 #include <android-base/parseint.h>
-#include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <android-base/thread_annotations.h>
 #include <android/multinetwork.h>  // ResNsendFlags
@@ -68,7 +67,6 @@
 
 using aidl::android::net::IDnsResolver;
 using aidl::android::net::ResolverOptionsParcel;
-using android::base::StringAppendF;
 using android::net::DnsQueryEvent;
 using android::net::DnsStats;
 using android::net::Experiments;
@@ -910,17 +908,19 @@ namespace {
 // Sampling rate varies by return code; events to log are chosen randomly, with a
 // probability proportional to the sampling rate.
 constexpr const char DEFAULT_SUBSAMPLING_MAP[] = "default:8 0:400 2:110 7:110";
+constexpr const char DEFAULT_MDNS_SUBSAMPLING_MAP[] = "default:1";
 
-std::unordered_map<int, uint32_t> resolv_get_dns_event_subsampling_map() {
+std::unordered_map<int, uint32_t> resolv_get_dns_event_subsampling_map(bool isMdns) {
     using android::base::ParseInt;
     using android::base::ParseUint;
     using android::base::Split;
     using server_configurable_flags::GetServerConfigurableFlag;
     std::unordered_map<int, uint32_t> sampling_rate_map{};
-    std::vector<std::string> subsampling_vector =
-            Split(GetServerConfigurableFlag("netd_native", "dns_event_subsample_map",
-                                            DEFAULT_SUBSAMPLING_MAP),
-                  " ");
+    const char* flag = isMdns ? "mdns_event_subsample_map" : "dns_event_subsample_map";
+    const char* defaultMap = isMdns ? DEFAULT_MDNS_SUBSAMPLING_MAP : DEFAULT_SUBSAMPLING_MAP;
+    const std::vector<std::string> subsampling_vector =
+            Split(GetServerConfigurableFlag("netd_native", flag, defaultMap), " ");
+
     for (const auto& pair : subsampling_vector) {
         std::vector<std::string> rate_denom = Split(pair, ":");
         int return_code;
@@ -1006,7 +1006,8 @@ struct Cache {
 struct NetConfig {
     explicit NetConfig(unsigned netId) : netid(netId) {
         cache = std::make_unique<Cache>();
-        dns_event_subsampling_map = resolv_get_dns_event_subsampling_map();
+        dns_event_subsampling_map = resolv_get_dns_event_subsampling_map(false);
+        mdns_event_subsampling_map = resolv_get_dns_event_subsampling_map(true);
     }
     int nameserverCount() { return nameserverSockAddrs.size(); }
     int setOptions(const ResolverOptionsParcel& resolverOptions) {
@@ -1037,6 +1038,7 @@ struct NetConfig {
     int wait_for_pending_req_timeout_count = 0;
     // Map format: ReturnCode:rate_denom
     std::unordered_map<int, uint32_t> dns_event_subsampling_map;
+    std::unordered_map<int, uint32_t> mdns_event_subsampling_map;
     DnsStats dnsStats;
 
     // Customized hostname/address table will be stored in customizedTable.
@@ -1118,11 +1120,9 @@ void _resolv_cache_query_failed(unsigned netid, const void* query, int querylen,
 }
 
 static void cache_dump_mru_locked(Cache* cache) {
-    std::string buf;
-
-    StringAppendF(&buf, "MRU LIST (%2d): ", cache->num_entries);
+    std::string buf = fmt::format("MRU LIST ({:2d}): ", cache->num_entries);
     for (Entry* e = cache->mru_list.mru_next; e != &cache->mru_list; e = e->mru_next) {
-        StringAppendF(&buf, " %d", e->id);
+        fmt::format_to(std::back_inserter(buf), " {}", e->id);
     }
 
     LOG(INFO) << __func__ << ": " << buf;
@@ -1199,7 +1199,7 @@ static void _cache_remove_oldest(Cache* cache) {
         return;
     }
     LOG(INFO) << __func__ << ": Cache full - removing oldest";
-    res_pquery(oldest->query, oldest->querylen);
+    res_pquery({oldest->query, oldest->querylen});
     _cache_remove_p(cache, lookup);
 }
 
@@ -1304,7 +1304,7 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, const void* query, int que
     /* remove stale entries here */
     if (now >= e->expires) {
         LOG(INFO) << __func__ << ": NOT IN CACHE (STALE ENTRY " << *lookup << "DISCARDED)";
-        res_pquery(e->query, e->querylen);
+        res_pquery({e->query, e->querylen});
         _cache_remove_p(cache, lookup);
         return RESOLV_CACHE_NOTFOUND;
     }
@@ -1794,18 +1794,20 @@ int android_net_res_stats_get_info_for_net(unsigned netid, int* nscount,
     return info->revision_id;
 }
 
-std::vector<std::string> resolv_cache_dump_subsampling_map(unsigned netid) {
-    using android::base::StringPrintf;
+std::vector<std::string> resolv_cache_dump_subsampling_map(unsigned netid, bool is_mdns) {
     std::lock_guard guard(cache_mutex);
     NetConfig* netconfig = find_netconfig_locked(netid);
     if (netconfig == nullptr) return {};
     std::vector<std::string> result;
-    for (const auto& pair : netconfig->dns_event_subsampling_map) {
-        result.push_back(StringPrintf("%s:%d",
-                                      (pair.first == DNSEVENT_SUBSAMPLING_MAP_DEFAULT_KEY)
-                                              ? "default"
-                                              : std::to_string(pair.first).c_str(),
-                                      pair.second));
+    const auto& subsampling_map = (!is_mdns) ? netconfig->dns_event_subsampling_map
+                                             : netconfig->mdns_event_subsampling_map;
+    result.reserve(subsampling_map.size());
+    for (const auto& [return_code, rate_denom] : subsampling_map) {
+        result.push_back(fmt::format("{}:{}",
+                                     (return_code == DNSEVENT_SUBSAMPLING_MAP_DEFAULT_KEY)
+                                             ? "default"
+                                             : std::to_string(return_code),
+                                     rate_denom));
     }
     return result;
 }
@@ -1814,11 +1816,12 @@ std::vector<std::string> resolv_cache_dump_subsampling_map(unsigned netid) {
 // a sampling factor derived from the netid and the return code.
 //
 // Returns the subsampling rate if the event should be sampled, or 0 if it should be discarded.
-uint32_t resolv_cache_get_subsampling_denom(unsigned netid, int return_code) {
+uint32_t resolv_cache_get_subsampling_denom(unsigned netid, int return_code, bool is_mdns) {
     std::lock_guard guard(cache_mutex);
     NetConfig* netconfig = find_netconfig_locked(netid);
     if (netconfig == nullptr) return 0;  // Don't log anything at all.
-    const auto& subsampling_map = netconfig->dns_event_subsampling_map;
+    const auto& subsampling_map = (!is_mdns) ? netconfig->dns_event_subsampling_map
+                                             : netconfig->mdns_event_subsampling_map;
     auto search_returnCode = subsampling_map.find(return_code);
     uint32_t denom;
     if (search_returnCode != subsampling_map.end()) {
