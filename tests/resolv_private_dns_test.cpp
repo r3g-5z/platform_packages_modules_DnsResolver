@@ -40,6 +40,8 @@ using android::netdutils::Stopwatch;
 using std::chrono::milliseconds;
 
 const std::string kDohFlag("persist.device_config.netd_native.doh");
+const std::string kDohQueryTimeoutFlag("persist.device_config.netd_native.doh_query_timeout_ms");
+const std::string kDohProbeTimeoutFlag("persist.device_config.netd_native.doh_probe_timeout_ms");
 
 namespace {
 
@@ -153,6 +155,11 @@ class BasePrivateDnsTest : public BaseTest {
   protected:
     void SetUp() override {
         mDohScopedProp = make_unique<ScopedSystemProperties>(kDohFlag, "1");
+        mDohQueryTimeoutScopedProp =
+                make_unique<ScopedSystemProperties>(kDohQueryTimeoutFlag, "1000");
+        unsigned int expectedProbeTimeout = kExpectedDohValidationTimeWhenTimeout.count();
+        mDohProbeTimeoutScopedProp = make_unique<ScopedSystemProperties>(
+                kDohProbeTimeoutFlag, std::to_string(expectedProbeTimeout));
         BaseTest::SetUp();
 
         static const std::vector<DnsRecord> records = {
@@ -195,7 +202,7 @@ class BasePrivateDnsTest : public BaseTest {
         std::this_thread::sleep_for(kExpectedDohValidationTimeWhenServerUnreachable);
     }
 
-    static constexpr milliseconds kExpectedDohValidationTimeWhenTimeout{3000};
+    static constexpr milliseconds kExpectedDohValidationTimeWhenTimeout{1000};
     static constexpr milliseconds kExpectedDohValidationTimeWhenServerUnreachable{1000};
     static constexpr char kQueryHostname[] = "TransportParameterizedTest.example.com.";
     static constexpr char kQueryAnswerA[] = "1.2.3.4";
@@ -207,8 +214,10 @@ class BasePrivateDnsTest : public BaseTest {
     test::DNSResponder doh_backend{"127.0.1.3", "53"};
     test::DNSResponder dot_backend{"127.0.2.3", "53"};
 
-    // Used to enable DoH during the tests.
+    // Used to enable DoH during the tests and set up a shorter timeout.
     std::unique_ptr<ScopedSystemProperties> mDohScopedProp;
+    std::unique_ptr<ScopedSystemProperties> mDohQueryTimeoutScopedProp;
+    std::unique_ptr<ScopedSystemProperties> mDohProbeTimeoutScopedProp;
 };
 
 // Parameterized test for the combination of DoH and DoT.
@@ -276,7 +285,7 @@ TEST_P(TransportParameterizedTest, GetAddrInfo) {
     if (testParamHasDoh()) {
         EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 0 /* dot */, 2 /* doh */));
     } else {
-        EXPECT_NO_FAILURE(expectQueries(2 /* dns */, 0 /* dot */, 0 /* doh */));
+        EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 2 /* dot */, 0 /* doh */));
     }
 
     // Stop the private DNS servers. Since we are in opportunistic mode, queries will
@@ -289,7 +298,7 @@ TEST_P(TransportParameterizedTest, GetAddrInfo) {
     if (testParamHasDoh()) {
         EXPECT_NO_FAILURE(expectQueries(2 /* dns */, 0 /* dot */, 2 /* doh */));
     } else {
-        EXPECT_NO_FAILURE(expectQueries(4 /* dns */, 0 /* dot */, 0 /* doh */));
+        EXPECT_NO_FAILURE(expectQueries(2 /* dns */, 2 /* dot */, 0 /* doh */));
     }
 }
 
@@ -348,8 +357,7 @@ TEST_F(PrivateDnsDohTest, ValidationFail) {
 
 // Tests that DoH query fails and fallback happens.
 //   - Fallback to UDP if DoH query times out
-//   - Fallback to DoT if DoH validation is in progress.
-//   - Fallback to UDP if DoH validation has failed.
+//   - Fallback to DoT if DoH validation is in progress or has failed.
 TEST_F(PrivateDnsDohTest, QueryFailover) {
     const auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
     ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
@@ -382,13 +390,6 @@ TEST_F(PrivateDnsDohTest, QueryFailover) {
 
     EXPECT_EQ(dot.queries(), 2);
     EXPECT_EQ(dns.queries().size(), 0U);
-    waitForDohValidationTimeout();
-    flushCache();
-
-    // Expect that this query fall back to UDP.
-    EXPECT_NO_FAILURE(sendQueryAndCheckResult());
-    EXPECT_EQ(dot.queries(), 2);
-    EXPECT_EQ(dns.queries().size(), 2U);
 }
 
 // Tests that the DnsResolver prioritizes IPv6 DoH servers over IPv4 DoH servers.

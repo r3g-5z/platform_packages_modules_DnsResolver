@@ -294,8 +294,6 @@ void ResolverController::stopPrefix64Discovery(int32_t netId) {
 int ResolverController::getPrefix64(unsigned netId, netdutils::IPPrefix* prefix) {
     netdutils::IPPrefix p = mDns64Configuration.getPrefix64(netId);
     if (p.family() != AF_INET6 || p.length() == 0) {
-        LOG(INFO) << "No valid NAT64 prefix (" << netId << ", " << p.toString().c_str() << ")";
-
         return -ENOENT;
     }
     *prefix = p;
@@ -321,7 +319,9 @@ void ResolverController::dump(DumpWriter& dw, unsigned netId) {
             dw.println("No DNS servers defined");
         } else {
             dw.println("DnsEvent subsampling map: " +
-                       android::base::Join(resolv_cache_dump_subsampling_map(netId), ' '));
+                       android::base::Join(resolv_cache_dump_subsampling_map(netId, false), ' '));
+            dw.println("DnsEvent subsampling map for MDNS: " +
+                       android::base::Join(resolv_cache_dump_subsampling_map(netId, true), ' '));
             dw.println(
                     "DNS servers: # IP (total, successes, errors, timeouts, internal errors, "
                     "RTT avg, last sample)");
