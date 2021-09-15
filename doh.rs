@@ -124,6 +124,12 @@ enum ConnectionStatus {
     Fail,
 }
 
+enum H3Result {
+    Data { data: Vec<u8> },
+    Finished,
+    Ignore,
+}
+
 trait OptionDeref<T: Deref> {
     fn as_deref(&self) -> Option<&T::Target>;
 }
@@ -207,7 +213,7 @@ struct DohConnection {
     udp_sk: UdpSocket,
     h3_conn: Option<h3::Connection>,
     status: ConnectionStatus,
-    query_map: HashMap<u64, QueryResponder>,
+    query_map: HashMap<u64, (Vec<u8>, QueryResponder)>,
     pending_queries: Vec<(DnsRequest, QueryResponder, Instant)>,
     cached_session: Option<Vec<u8>>,
     expired_time: Option<BootTime>,
@@ -257,14 +263,20 @@ impl DohConnection {
         loop {
             self.recv_rx().await?;
             self.flush_tx().await?;
-            if let Ok((stream_id, _buf)) = self.recv_query() {
-                if stream_id == req_id {
+            loop {
+                match self.recv_h3() {
+                    Ok((stream_id, H3Result::Finished)) => {
+                        if stream_id == req_id {
+                            return Ok(());
+                        }
+                    }
                     // TODO: Verify the answer
-                    break;
+                    Ok((_stream_id, H3Result::Data { .. })) => {}
+                    Ok((_stream_id, H3Result::Ignore)) => {}
+                    Err(_) => break,
                 }
             }
         }
-        Ok(())
     }
 
     async fn connect(&mut self) -> Result<()> {
@@ -302,7 +314,7 @@ impl DohConnection {
         match self.status {
             ConnectionStatus::Ready => match self.send_dns_query(&req).await {
                 Ok(req_id) => {
-                    self.query_map.insert(req_id, resp);
+                    self.query_map.insert(req_id, (Vec::new(), resp));
                 }
                 Err(e) => {
                     if let Ok(quiche::h3::Error::StreamBlocked) = e.downcast::<quiche::h3::Error>()
@@ -357,21 +369,34 @@ impl DohConnection {
                     }
                 }
             }
-            // TODO: clean up the expired queries.
             self.recv_rx().await?;
             self.flush_tx().await?;
-            if let Ok((stream_id, buf)) = self.recv_query() {
-                if let Some(resp) = self.query_map.remove(&stream_id) {
-                    debug!(
-                        "sending answer back to resolv, Network {}, stream id: {}",
-                        self.net_id, stream_id
-                    );
-                    resp.send(Response::Success { answer: buf }).unwrap_or_else(|e| {
-                        trace!("the receiver dropped {:?}, stream id: {}", e, stream_id);
-                    });
-                } else {
-                    // Should not happen
-                    warn!("No associated receiver found");
+            loop {
+                match self.recv_h3() {
+                    Ok((stream_id, H3Result::Data { mut data })) => {
+                        if let Some((answer, _)) = self.query_map.get_mut(&stream_id) {
+                            answer.append(&mut data);
+                        } else {
+                            // Should not happen
+                            warn!("No associated receiver found while receiving Data, Network {}, stream id: {}", self.net_id, stream_id);
+                        }
+                    }
+                    Ok((stream_id, H3Result::Finished)) => {
+                        if let Some((answer, resp)) = self.query_map.remove(&stream_id) {
+                            debug!(
+                                "sending answer back to resolv, Network {}, stream id: {}",
+                                self.net_id, stream_id
+                            );
+                            resp.send(Response::Success { answer }).unwrap_or_else(|e| {
+                                trace!("the receiver dropped {:?}, stream id: {}", e, stream_id);
+                            });
+                        } else {
+                            // Should not happen
+                            warn!("No associated receiver found while receiving Finished, Network {}, stream id: {}", self.net_id, stream_id);
+                        }
+                    }
+                    Ok((_stream_id, H3Result::Ignore)) => {}
+                    Err(_) => break,
                 }
             }
             if self.quic_conn.is_closed() || !self.quic_conn.is_established() {
@@ -381,15 +406,15 @@ impl DohConnection {
         }
     }
 
-    fn recv_query(&mut self) -> Result<(u64, Vec<u8>)> {
+    fn recv_h3(&mut self) -> Result<(u64, H3Result)> {
         let h3_conn = self.h3_conn.as_mut().ok_or_else(|| anyhow!("h3 conn isn't available"))?;
-        loop {
-            match h3_conn.poll(&mut self.quic_conn) {
-                // Process HTTP/3 events.
-                Ok((stream_id, quiche::h3::Event::Data)) => {
-                    debug!("quiche::h3::Event::Data");
-                    let mut buf = vec![0; MAX_DATAGRAM_SIZE];
-                    if let Ok(read) = h3_conn.recv_body(&mut self.quic_conn, stream_id, &mut buf) {
+        match h3_conn.poll(&mut self.quic_conn) {
+            // Process HTTP/3 events.
+            Ok((stream_id, quiche::h3::Event::Data)) => {
+                debug!("quiche::h3::Event::Data");
+                let mut buf = vec![0; MAX_DATAGRAM_SIZE];
+                match h3_conn.recv_body(&mut self.quic_conn, stream_id, &mut buf) {
+                    Ok(read) => {
                         trace!(
                             "got {} bytes of response data on stream {}: {:x?}",
                             read,
@@ -397,28 +422,37 @@ impl DohConnection {
                             &buf[..read]
                         );
                         buf.truncate(read);
-                        return Ok((stream_id, buf));
+                        Ok((stream_id, H3Result::Data { data: buf }))
+                    }
+                    Err(e) => {
+                        warn!("recv_h3::recv_body {:?}", e);
+                        bail!(e);
                     }
                 }
-                Ok((stream_id, quiche::h3::Event::Headers { list, has_body })) => {
-                    debug!(
-                        "got response headers {:?} on stream id {} has_body {}",
-                        list, stream_id, has_body
-                    );
-                }
-                Ok((stream_id, quiche::h3::Event::Finished)) => {
-                    debug!("quiche::h3::Event::Finished on stream id {}", stream_id);
-                }
-                Ok((stream_id, quiche::h3::Event::Datagram)) => {
-                    debug!("quiche::h3::Event::Datagram on stream id {}", stream_id);
-                }
-                Ok((stream_id, quiche::h3::Event::GoAway)) => {
-                    debug!("quiche::h3::Event::GoAway on stream id {}", stream_id);
-                }
-                Err(e) => {
-                    debug!("recv_query {:?}", e);
-                    bail!(e);
-                }
+            }
+            Ok((stream_id, quiche::h3::Event::Headers { list, has_body })) => {
+                debug!(
+                    "got response headers {:?} on stream id {} has_body {}",
+                    list, stream_id, has_body
+                );
+                Ok((stream_id, H3Result::Ignore))
+            }
+            Ok((stream_id, quiche::h3::Event::Finished)) => {
+                debug!("quiche::h3::Event::Finished on stream id {}", stream_id);
+                Ok((stream_id, H3Result::Finished))
+            }
+            Ok((stream_id, quiche::h3::Event::Datagram)) => {
+                debug!("quiche::h3::Event::Datagram on stream id {}", stream_id);
+                Ok((stream_id, H3Result::Ignore))
+            }
+            // TODO: Check if it's necessary to handle GoAway event.
+            Ok((stream_id, quiche::h3::Event::GoAway)) => {
+                debug!("quiche::h3::Event::GoAway on stream id {}", stream_id);
+                Ok((stream_id, H3Result::Ignore))
+            }
+            Err(e) => {
+                debug!("recv_h3 {:?}", e);
+                bail!(e);
             }
         }
     }
@@ -679,6 +713,19 @@ async fn handle_query_cmd(
         let _ = resp.send(Response::Error { error: QueryError::ServerNotReady });
     }
 }
+fn need_process_queries(doh_conn_map: &HashMap<u32, (ServerInfo, Option<DohConnection>)>) -> bool {
+    if doh_conn_map.is_empty() {
+        return false;
+    }
+    for (_, doh_conn) in doh_conn_map.values() {
+        if let Some(doh_conn) = doh_conn {
+            if !doh_conn.query_map.is_empty() || !doh_conn.pending_queries.is_empty() {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 async fn doh_handler(
     mut cmd_rx: CmdReceiver,
@@ -703,7 +750,7 @@ async fn doh_handler(
                     }
                 }
                 join_all(futures).await
-            } , if !doh_conn_map.is_empty() => {},
+            }, if need_process_queries(&doh_conn_map) => {},
             Some(result) = probe_futures.next() => {
                 let runtime_clone = runtime.clone();
                 handle_probe_result(result, &mut doh_conn_map, runtime_clone, validation_fn);
@@ -1015,12 +1062,11 @@ pub unsafe extern "C" fn doh_query(
                         response.copy_from_slice(&answer);
                         answer.len() as ssize_t
                     }
-                    Response::Error { error: QueryError::ServerNotReady } => RESULT_CAN_NOT_SEND,
-                    _ => RESULT_INTERNAL_ERROR,
+                    _ => RESULT_CAN_NOT_SEND,
                 },
                 Err(e) => {
                     error!("no result {}", e);
-                    RESULT_INTERNAL_ERROR
+                    RESULT_CAN_NOT_SEND
                 }
             },
             Err(e) => {
@@ -1029,7 +1075,7 @@ pub unsafe extern "C" fn doh_query(
             }
         }
     } else {
-        RESULT_INTERNAL_ERROR
+        RESULT_CAN_NOT_SEND
     }
 }
 
