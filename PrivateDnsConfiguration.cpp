@@ -386,6 +386,16 @@ void PrivateDnsConfiguration::setObserver(PrivateDnsValidationObserver* observer
     mObserver = observer;
 }
 
+base::Result<netdutils::IPSockAddr> PrivateDnsConfiguration::getDohServer(unsigned netId) const {
+    std::lock_guard guard(mPrivateDnsLock);
+    auto it = mDohTracker.find(netId);
+    if (it != mDohTracker.end()) {
+        return netdutils::IPSockAddr::toIPSockAddr(it->second.ipAddr, 443);
+    }
+
+    return Errorf("Failed to get DoH Server: netId {} not found", netId);
+}
+
 void PrivateDnsConfiguration::notifyValidationStateUpdate(const netdutils::IPSockAddr& sockaddr,
                                                           Validation validation,
                                                           uint32_t netId) const {
@@ -418,7 +428,8 @@ void PrivateDnsConfiguration::initDohLocked() {
             [](uint32_t net_id, bool success, const char* ip_addr, const char* host) {
                 android::net::PrivateDnsConfiguration::getInstance().onDohStatusUpdate(
                         net_id, success, ip_addr, host);
-            });
+            },
+            [](int32_t sock) { resolv_tag_socket(sock, AID_DNS, NET_CONTEXT_INVALID_PID); });
 }
 
 int PrivateDnsConfiguration::setDoh(int32_t netId, uint32_t mark,
