@@ -34,6 +34,7 @@
 #include "tests/unsolicited_listener/unsolicited_event_listener.h"
 
 using aidl::android::net::resolv::aidl::IDnsResolverUnsolicitedEventListener;
+using android::base::unique_fd;
 using android::net::resolv::aidl::UnsolicitedEventListener;
 using android::netdutils::ScopedAddrinfo;
 using android::netdutils::Stopwatch;
@@ -189,6 +190,7 @@ class BasePrivateDnsTest : public BaseTest {
     }
 
     void TearDown() override {
+        DumpResolverService();
         mDohScopedProp.reset();
         BaseTest::TearDown();
     }
@@ -214,6 +216,14 @@ class BasePrivateDnsTest : public BaseTest {
     // Used when a DoH probe is sent while the DoH server is not listening on the port.
     void waitForDohValidationFailed() {
         std::this_thread::sleep_for(kExpectedDohValidationTimeWhenServerUnreachable);
+    }
+
+    void DumpResolverService() {
+        unique_fd fd(open("/dev/null", O_WRONLY));
+        EXPECT_EQ(mDnsClient.resolvService()->dump(fd, nullptr, 0), 0);
+
+        const char* querylogCmd[] = {"querylog"};  // Keep it sync with DnsQueryLog::DUMP_KEYWORD.
+        EXPECT_EQ(mDnsClient.resolvService()->dump(fd, querylogCmd, std::size(querylogCmd)), 0);
     }
 
     static constexpr milliseconds kExpectedDohValidationTimeWhenTimeout{1000};
@@ -450,4 +460,60 @@ TEST_F(PrivateDnsDohTest, PreferIpv6) {
 
         resetNetwork();
     }
+}
+
+// Tests that DoH server setting can be replaced/removed correctly.
+TEST_F(PrivateDnsDohTest, ChangeAndClearPrivateDnsServer) {
+    constexpr char listen_ipv6_addr[] = "::1";
+
+    // To simplify the test, set the DoT server broken.
+    dot.stopServer();
+
+    test::DNSResponder dns_ipv6{listen_ipv6_addr, "53"};
+    test::DohFrontend doh_ipv6{listen_ipv6_addr, "443", listen_ipv6_addr, "53"};
+    dns_ipv6.addMapping(kQueryHostname, ns_type::ns_t_a, kQueryAnswerA);
+    dns_ipv6.addMapping(kQueryHostname, ns_type::ns_t_aaaa, kQueryAnswerAAAA);
+    ASSERT_TRUE(dns_ipv6.startServer());
+    ASSERT_TRUE(doh_ipv6.startServer());
+
+    auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+    // Use v4 DoH server first.
+    EXPECT_TRUE(WaitForDohValidation(test::kDefaultListenAddr, true));
+    doh.clearQueries();
+    EXPECT_NO_FAILURE(sendQueryAndCheckResult());
+    EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 0 /* dot */, 2 /* doh */));
+
+    // Change to the v6 DoH server.
+    parcel.servers = {listen_ipv6_addr};
+    parcel.tlsServers = {listen_ipv6_addr};
+    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+    EXPECT_TRUE(WaitForDohValidation(listen_ipv6_addr, true));
+    doh.clearQueries();
+    doh_ipv6.clearQueries();
+    flushCache();
+    EXPECT_NO_FAILURE(sendQueryAndCheckResult());
+    EXPECT_EQ(doh_ipv6.queries(), 2);
+    EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 0 /* dot */, 0 /* doh */));
+
+    // Change to an invalid DoH server.
+    parcel.tlsServers = {kHelloExampleComAddrV4};
+    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+    doh_ipv6.clearQueries();
+    dns_ipv6.clearQueries();
+    flushCache();
+    EXPECT_NO_FAILURE(sendQueryAndCheckResult());
+    EXPECT_EQ(doh_ipv6.queries(), 0);
+    EXPECT_EQ(dns_ipv6.queries().size(), 2U);
+
+    // Remove private DNS servers.
+    parcel.tlsServers = {};
+    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+    doh_ipv6.clearQueries();
+    dns_ipv6.clearQueries();
+    flushCache();
+    EXPECT_NO_FAILURE(sendQueryAndCheckResult());
+    EXPECT_EQ(doh_ipv6.queries(), 0);
+    EXPECT_EQ(dns_ipv6.queries().size(), 2U);
 }
