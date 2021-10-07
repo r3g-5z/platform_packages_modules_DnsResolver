@@ -106,10 +106,10 @@ std::list<DnsTlsServer> DnsTlsDispatcher::getOrderedAndUsableServerList(
 }
 
 DnsTlsTransport::Response DnsTlsDispatcher::query(const std::list<DnsTlsServer>& tlsServers,
-                                                  res_state statp, const Slice query,
+                                                  ResState* statp, const Slice query,
                                                   const Slice ans, int* resplen) {
     const std::list<DnsTlsServer> servers(
-            getOrderedAndUsableServerList(tlsServers, statp->netid, statp->_mark));
+            getOrderedAndUsableServerList(tlsServers, statp->netid, statp->mark));
 
     if (servers.empty()) LOG(WARNING) << "No usable DnsTlsServers";
 
@@ -121,14 +121,15 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const std::list<DnsTlsServer>&
 
         bool connectTriggered = false;
         Stopwatch queryStopwatch;
-        code = this->query(server, statp->netid, statp->_mark, query, ans, resplen,
+        code = this->query(server, statp->netid, statp->mark, query, ans, resplen,
                            &connectTriggered);
 
         dnsQueryEvent->set_latency_micros(saturate_cast<int32_t>(queryStopwatch.timeTakenUs()));
         dnsQueryEvent->set_dns_server_index(serverCount++);
         dnsQueryEvent->set_ip_version(ipFamilyToIPVersion(server.ss.ss_family));
         dnsQueryEvent->set_protocol(PROTO_DOT);
-        dnsQueryEvent->set_type(getQueryType(query.base(), query.size()));
+        std::span<const uint8_t> msg(query.base(), query.size());
+        dnsQueryEvent->set_type(getQueryType(msg));
         dnsQueryEvent->set_connected(connectTriggered);
 
         switch (code) {
