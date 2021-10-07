@@ -31,6 +31,7 @@
 #include "ResolverEventReporter.h"
 #include "doh.h"
 #include "netd_resolv/resolv.h"
+#include "resolv_cache.h"
 #include "resolv_private.h"
 #include "util.h"
 
@@ -428,7 +429,8 @@ void PrivateDnsConfiguration::initDohLocked() {
             [](uint32_t net_id, bool success, const char* ip_addr, const char* host) {
                 android::net::PrivateDnsConfiguration::getInstance().onDohStatusUpdate(
                         net_id, success, ip_addr, host);
-            });
+            },
+            [](int32_t sock) { resolv_tag_socket(sock, AID_DNS, NET_CONTEXT_INVALID_PID); });
 }
 
 int PrivateDnsConfiguration::setDoh(int32_t netId, uint32_t mark,
@@ -475,6 +477,7 @@ int PrivateDnsConfiguration::setDoh(int32_t netId, uint32_t mark,
                            dohId.status);
         mPrivateDnsLog.push(std::move(record));
         LOG(INFO) << __func__ << ": Upgrading server to DoH: " << name;
+        resolv_stats_set_addrs(netId, PROTO_DOH, {dohId.ipAddr}, 443);
 
         int probeTimeout = Experiments::getInstance()->getFlag("doh_probe_timeout_ms",
                                                                kDohProbeDefaultTimeoutMs);
@@ -494,6 +497,7 @@ void PrivateDnsConfiguration::clearDohLocked(unsigned netId) {
     LOG(DEBUG) << "PrivateDnsConfiguration::clearDohLocked (" << netId << ")";
     if (mDohDispatcher != nullptr) doh_net_delete(mDohDispatcher, netId);
     mDohTracker.erase(netId);
+    resolv_stats_set_addrs(netId, PROTO_DOH, {}, 443);
 }
 
 void PrivateDnsConfiguration::clearDoh(unsigned netId) {
