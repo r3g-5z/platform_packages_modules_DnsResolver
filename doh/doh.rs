@@ -20,19 +20,17 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures::future::join_all;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use libc::{c_char, int32_t, size_t, ssize_t, uint32_t, uint64_t};
+use libc::{c_char, int32_t, uint32_t};
 use log::{debug, error, info, trace, warn};
 use quiche::h3;
 use ring::rand::SecureRandom;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
-use std::str::FromStr;
-use std::sync::{Arc, Mutex, Once};
-use std::{ptr, slice};
+use std::sync::{Arc, Mutex};
 use tokio::net::UdpSocket;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{mpsc, oneshot};
@@ -40,24 +38,7 @@ use tokio::task;
 use tokio::time::{timeout, Duration, Instant};
 use url::Url;
 
-static INIT: Once = Once::new();
-
-/// The return code of doh_query means that there is no answer.
-pub const RESULT_INTERNAL_ERROR: ssize_t = -1;
-/// The return code of doh_query means that query can't be sent.
-pub const RESULT_CAN_NOT_SEND: ssize_t = -2;
-/// The return code of doh_query to indicate that the query timed out.
-pub const RESULT_TIMEOUT: ssize_t = -255;
-/// The error log level.
-pub const LOG_LEVEL_ERROR: u32 = 0;
-/// The warning log level.
-pub const LOG_LEVEL_WARN: u32 = 1;
-/// The info log level.
-pub const LOG_LEVEL_INFO: u32 = 2;
-/// The debug log level.
-pub const LOG_LEVEL_DEBUG: u32 = 3;
-/// The trace log level.
-pub const LOG_LEVEL_TRACE: u32 = 4;
+mod ffi;
 
 const MAX_BUFFERED_CMD_SIZE: usize = 400;
 const MAX_INCOMING_BUFFER_SIZE_WHOLE: u64 = 10000000;
@@ -66,7 +47,6 @@ const MAX_CONCURRENT_STREAM_SIZE: u64 = 100;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const DOH_PORT: u16 = 443;
 const QUICHE_IDLE_TIMEOUT_MS: u64 = 180000;
-const SYSTEM_CERT_PATH: &str = "/system/etc/security/cacerts";
 const NS_T_AAAA: u8 = 28;
 const NS_C_IN: u8 = 1;
 // Used to randomly generate query prefix and query id.
@@ -82,6 +62,7 @@ type QueryResponder = oneshot::Sender<Response>;
 type DnsRequest = Vec<quiche::h3::Header>;
 type ValidationCallback =
     extern "C" fn(net_id: uint32_t, success: bool, ip_addr: *const c_char, host: *const c_char);
+type TagSocketCallback = extern "C" fn(sock: int32_t);
 
 #[derive(Eq, PartialEq, Debug)]
 enum QueryError {
@@ -185,23 +166,24 @@ pub struct DohDispatcher {
     /// Used to submit cmds to the I/O task.
     cmd_sender: CmdSender,
     join_handle: task::JoinHandle<Result<()>>,
-    runtime: Arc<Runtime>,
+    runtime: Runtime,
 }
 
 // DoH dispatcher
 impl DohDispatcher {
-    fn new(validation_fn: ValidationCallback) -> Result<Box<DohDispatcher>> {
+    fn new(
+        validation_fn: ValidationCallback,
+        tag_socket_fn: TagSocketCallback,
+    ) -> Result<DohDispatcher> {
         let (cmd_sender, cmd_receiver) = mpsc::channel::<DohCommand>(MAX_BUFFERED_CMD_SIZE);
-        let runtime = Arc::new(
-            Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .thread_name("doh-handler")
-                .build()
-                .expect("Failed to create tokio runtime"),
-        );
-        let join_handle = runtime.spawn(doh_handler(cmd_receiver, runtime.clone(), validation_fn));
-        Ok(Box::new(DohDispatcher { cmd_sender, join_handle, runtime }))
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("doh-handler")
+            .build()
+            .expect("Failed to create tokio runtime");
+        let join_handle = runtime.spawn(doh_handler(cmd_receiver, validation_fn, tag_socket_fn));
+        Ok(DohDispatcher { cmd_sender, join_handle, runtime })
     }
 
     fn send_cmd(&self, cmd: DohCommand) -> Result<()> {
@@ -224,12 +206,14 @@ struct DohConnection {
     state: ConnectionState,
     pending_queries: Vec<(DnsRequest, QueryResponder, Instant)>,
     cached_session: Option<Vec<u8>>,
+    tag_socket_fn: TagSocketCallback,
 }
 
 impl DohConnection {
     fn new(
         info: &ServerInfo,
         shared_config: Arc<Mutex<QuicheConfigCache>>,
+        tag_socket_fn: TagSocketCallback,
     ) -> Result<DohConnection> {
         let mut scid = [0; quiche::MAX_CONN_ID_LEN];
         ring::rand::SystemRandom::new().fill(&mut scid).context("failed to generate scid")?;
@@ -240,6 +224,7 @@ impl DohConnection {
             state: ConnectionState::Idle,
             pending_queries: Vec::new(),
             cached_session: None,
+            tag_socket_fn,
         })
     }
 
@@ -247,6 +232,7 @@ impl DohConnection {
         self.state = match self.state {
             ConnectionState::Idle => {
                 let udp_sk_std = make_doh_udp_socket(self.info.peer_addr, self.info.sk_mark)?;
+                (self.tag_socket_fn)(udp_sk_std.as_raw_fd());
                 let udp_sk = UdpSocket::from_std(udp_sk_std)?;
                 let connid = quiche::ConnectionId::from_ref(&self.scid);
                 let mut cache = self.shared_config.lock().unwrap();
@@ -700,10 +686,9 @@ async fn flush_tx(
     Ok(())
 }
 
-fn report_private_dns_validation(
+async fn report_private_dns_validation(
     info: &ServerInfo,
     state: &ConnectionState,
-    runtime: Arc<Runtime>,
     validation_fn: ValidationCallback,
 ) {
     let (ip_addr, domain) = match (
@@ -718,14 +703,16 @@ fn report_private_dns_validation(
     };
     let netd_id = info.net_id;
     let success = matches!(state, ConnectionState::Connected { .. });
-    runtime
-        .spawn_blocking(move || validation_fn(netd_id, success, ip_addr.as_ptr(), domain.as_ptr()));
+    task::spawn_blocking(move || {
+        validation_fn(netd_id, success, ip_addr.as_ptr(), domain.as_ptr())
+    })
+    .await
+    .unwrap_or_else(|e| warn!("Validation function task failed: {}", e));
 }
 
-fn handle_probe_result(
+async fn handle_probe_result(
     result: (ServerInfo, Result<DohConnection, (anyhow::Error, DohConnection)>),
     doh_conn_map: &mut HashMap<u32, (ServerInfo, Option<DohConnection>)>,
-    runtime: Arc<Runtime>,
     validation_fn: ValidationCallback,
 ) {
     let (info, doh_conn) = match result {
@@ -756,7 +743,7 @@ fn handle_probe_result(
             return;
         }
     }
-    report_private_dns_validation(&info, &doh_conn.state, runtime, validation_fn);
+    report_private_dns_validation(&info, &doh_conn.state, validation_fn).await;
     doh_conn_map.insert(info.net_id, (info, Some(doh_conn)));
 }
 
@@ -775,6 +762,7 @@ fn make_connection_if_needed(
     info: &ServerInfo,
     doh_conn_map: &mut HashMap<u32, (ServerInfo, Option<DohConnection>)>,
     shared_config: Arc<Mutex<QuicheConfigCache>>,
+    tag_socket_fn: TagSocketCallback,
 ) -> Result<Option<DohConnection>> {
     // Check if connection exists.
     match doh_conn_map.get(&info.net_id) {
@@ -790,7 +778,7 @@ fn make_connection_if_needed(
         // TODO: change the inner connection instead of removing?
         _ => doh_conn_map.remove(&info.net_id),
     };
-    let doh = DohConnection::new(info, shared_config)?;
+    let doh = DohConnection::new(info, shared_config, tag_socket_fn)?;
     doh_conn_map.insert(info.net_id, (info.clone(), None));
     Ok(Some(doh))
 }
@@ -859,8 +847,8 @@ fn need_process_queries(doh_conn_map: &HashMap<u32, (ServerInfo, Option<DohConne
 
 async fn doh_handler(
     mut cmd_rx: CmdReceiver,
-    runtime: Arc<Runtime>,
     validation_fn: ValidationCallback,
+    tag_socket_fn: TagSocketCallback,
 ) -> Result<()> {
     info!("doh_dispatcher entry");
     let config_cache = Arc::new(Mutex::new(QuicheConfigCache { cert_path: None, config: None }));
@@ -880,15 +868,14 @@ async fn doh_handler(
                 join_all(futures).await
             }, if need_process_queries(&doh_conn_map) => {},
             Some(result) = probe_futures.next() => {
-                let runtime_clone = runtime.clone();
-                handle_probe_result(result, &mut doh_conn_map, runtime_clone, validation_fn);
+                handle_probe_result(result, &mut doh_conn_map, validation_fn).await;
                 info!("probe_futures remaining size: {}", probe_futures.len());
             },
             Some(cmd) = cmd_rx.recv() => {
                 trace!("recv {:?}", cmd);
                 match cmd {
                     DohCommand::Probe { info, timeout: t } => {
-                        match make_connection_if_needed(&info, &mut doh_conn_map, config_cache.clone()) {
+                        match make_connection_if_needed(&info, &mut doh_conn_map, config_cache.clone(), tag_socket_fn) {
                             Ok(Some(doh)) => {
                                 // Create a new async task associated to the DoH connection.
                                 probe_futures.push(probe_task(info, doh, t));
@@ -901,7 +888,7 @@ async fn doh_handler(
                             }
                             Err(e) => {
                                 error!("create connection for network {} error {:?}", info.net_id, e);
-                                report_private_dns_validation(&info, &ConnectionState::Error, runtime.clone(), validation_fn);
+                                report_private_dns_validation(&info, &ConnectionState::Error, validation_fn).await;
                             }
                         }
                     },
@@ -1021,203 +1008,6 @@ fn make_probe_query() -> Result<String> {
     Ok(base64::encode_config(query, base64::URL_SAFE_NO_PAD))
 }
 
-/// Performs static initialization for android logger.
-#[no_mangle]
-pub extern "C" fn doh_init_logger(level: u32) {
-    INIT.call_once(|| {
-        let level = match level {
-            LOG_LEVEL_WARN => log::Level::Warn,
-            LOG_LEVEL_DEBUG => log::Level::Debug,
-            _ => log::Level::Error,
-        };
-        android_logger::init_once(android_logger::Config::default().with_min_level(level));
-    });
-}
-
-/// Set the log level.
-#[no_mangle]
-pub extern "C" fn doh_set_log_level(level: u32) {
-    let level = match level {
-        LOG_LEVEL_ERROR => log::LevelFilter::Error,
-        LOG_LEVEL_WARN => log::LevelFilter::Warn,
-        LOG_LEVEL_INFO => log::LevelFilter::Info,
-        LOG_LEVEL_DEBUG => log::LevelFilter::Debug,
-        LOG_LEVEL_TRACE => log::LevelFilter::Trace,
-        _ => log::LevelFilter::Off,
-    };
-    log::set_max_level(level);
-}
-
-/// Performs the initialization for the DoH engine.
-/// Creates and returns a DoH engine instance.
-#[no_mangle]
-pub extern "C" fn doh_dispatcher_new(ptr: ValidationCallback) -> *mut DohDispatcher {
-    match DohDispatcher::new(ptr) {
-        Ok(c) => Box::into_raw(c),
-        Err(e) => {
-            error!("doh_dispatcher_new: failed: {:?}", e);
-            ptr::null_mut()
-        }
-    }
-}
-
-/// Deletes a DoH engine created by doh_dispatcher_new().
-/// # Safety
-/// `doh` must be a non-null pointer previously created by `doh_dispatcher_new()`
-/// and not yet deleted by `doh_dispatcher_delete()`.
-#[no_mangle]
-pub unsafe extern "C" fn doh_dispatcher_delete(doh: *mut DohDispatcher) {
-    Box::from_raw(doh).exit_handler()
-}
-
-/// Probes and stores the DoH server with the given configurations.
-/// Use the negative errno-style codes as the return value to represent the result.
-/// # Safety
-/// `doh` must be a non-null pointer previously created by `doh_dispatcher_new()`
-/// and not yet deleted by `doh_dispatcher_delete()`.
-/// `url`, `domain`, `ip_addr`, `cert_path` are null terminated strings.
-#[no_mangle]
-pub unsafe extern "C" fn doh_net_new(
-    doh: &mut DohDispatcher,
-    net_id: uint32_t,
-    url: *const c_char,
-    domain: *const c_char,
-    ip_addr: *const c_char,
-    sk_mark: libc::uint32_t,
-    cert_path: *const c_char,
-    timeout_ms: libc::uint64_t,
-) -> int32_t {
-    let (url, domain, ip_addr, cert_path) = match (
-        std::ffi::CStr::from_ptr(url).to_str(),
-        std::ffi::CStr::from_ptr(domain).to_str(),
-        std::ffi::CStr::from_ptr(ip_addr).to_str(),
-        std::ffi::CStr::from_ptr(cert_path).to_str(),
-    ) {
-        (Ok(url), Ok(domain), Ok(ip_addr), Ok(cert_path)) => {
-            if domain.is_empty() {
-                (url, None, ip_addr.to_string(), None)
-            } else if !cert_path.is_empty() {
-                (url, Some(domain.to_string()), ip_addr.to_string(), Some(cert_path.to_string()))
-            } else {
-                (
-                    url,
-                    Some(domain.to_string()),
-                    ip_addr.to_string(),
-                    Some(SYSTEM_CERT_PATH.to_string()),
-                )
-            }
-        }
-        _ => {
-            error!("bad input"); // Should not happen
-            return -libc::EINVAL;
-        }
-    };
-
-    let (url, ip_addr) = match (url::Url::parse(url), IpAddr::from_str(&ip_addr)) {
-        (Ok(url), Ok(ip_addr)) => (url, ip_addr),
-        _ => {
-            error!("bad ip or url"); // Should not happen
-            return -libc::EINVAL;
-        }
-    };
-    let cmd = DohCommand::Probe {
-        info: ServerInfo {
-            net_id,
-            url,
-            peer_addr: SocketAddr::new(ip_addr, DOH_PORT),
-            domain,
-            sk_mark,
-            cert_path,
-        },
-        timeout: Duration::from_millis(timeout_ms),
-    };
-    if let Err(e) = doh.send_cmd(cmd) {
-        error!("Failed to send the probe: {:?}", e);
-        return -libc::EPIPE;
-    }
-    0
-}
-
-/// Sends a DNS query via the network associated to the given |net_id| and waits for the response.
-/// The return code should be either one of the public constant RESULT_* to indicate the error or
-/// the size of the answer.
-/// # Safety
-/// `doh` must be a non-null pointer previously created by `doh_dispatcher_new()`
-/// and not yet deleted by `doh_dispatcher_delete()`.
-/// `dns_query` must point to a buffer at least `dns_query_len` in size.
-/// `response` must point to a buffer at least `response_len` in size.
-#[no_mangle]
-pub unsafe extern "C" fn doh_query(
-    doh: &mut DohDispatcher,
-    net_id: uint32_t,
-    dns_query: *mut u8,
-    dns_query_len: size_t,
-    response: *mut u8,
-    response_len: size_t,
-    timeout_ms: uint64_t,
-) -> ssize_t {
-    let q = slice::from_raw_parts_mut(dns_query, dns_query_len);
-
-    let (resp_tx, resp_rx) = oneshot::channel();
-    let t = Duration::from_millis(timeout_ms);
-    if let Some(expired_time) = Instant::now().checked_add(t) {
-        let cmd = DohCommand::Query {
-            net_id,
-            base64_query: base64::encode_config(q, base64::URL_SAFE_NO_PAD),
-            expired_time,
-            resp: resp_tx,
-        };
-
-        if let Err(e) = doh.send_cmd(cmd) {
-            error!("Failed to send the query: {:?}", e);
-            return RESULT_CAN_NOT_SEND;
-        }
-    } else {
-        error!("Bad timeout parameter: {}", timeout_ms);
-        return RESULT_CAN_NOT_SEND;
-    }
-
-    if let Ok(rt) = Runtime::new() {
-        let local = task::LocalSet::new();
-        match local.block_on(&rt, async { timeout(t, resp_rx).await }) {
-            Ok(v) => match v {
-                Ok(v) => match v {
-                    Response::Success { answer } => {
-                        if answer.len() > response_len || answer.len() > isize::MAX as usize {
-                            return RESULT_INTERNAL_ERROR;
-                        }
-                        let response = slice::from_raw_parts_mut(response, answer.len());
-                        response.copy_from_slice(&answer);
-                        answer.len() as ssize_t
-                    }
-                    _ => RESULT_CAN_NOT_SEND,
-                },
-                Err(e) => {
-                    error!("no result {}", e);
-                    RESULT_CAN_NOT_SEND
-                }
-            },
-            Err(e) => {
-                error!("timeout: {}", e);
-                RESULT_TIMEOUT
-            }
-        }
-    } else {
-        RESULT_CAN_NOT_SEND
-    }
-}
-
-/// Clears the DoH servers associated with the given |netid|.
-/// # Safety
-/// `doh` must be a non-null pointer previously created by `doh_dispatcher_new()`
-/// and not yet deleted by `doh_dispatcher_delete()`.
-#[no_mangle]
-pub extern "C" fn doh_net_delete(doh: &mut DohDispatcher, net_id: uint32_t) {
-    if let Err(e) = doh.send_cmd(DohCommand::Clear { net_id }) {
-        error!("Failed to send the query: {:?}", e);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1237,7 +1027,7 @@ mod tests {
         ServerInfo,
         HashMap<u32, (ServerInfo, Option<DohConnection>)>,
         Arc<Mutex<QuicheConfigCache>>,
-        Arc<Runtime>,
+        Runtime,
     ) {
         let test_map: HashMap<u32, (ServerInfo, Option<DohConnection>)> = HashMap::new();
         let info = ServerInfo {
@@ -1251,14 +1041,16 @@ mod tests {
         let config_cache =
             Arc::new(Mutex::new(QuicheConfigCache { cert_path: None, config: None }));
 
-        let rt = Arc::new(
-            Builder::new_current_thread()
-                .thread_name("test-runtime")
-                .enable_all()
-                .build()
-                .expect("Failed to create testing tokio runtime"),
-        );
+        let rt = Builder::new_current_thread()
+            .thread_name("test-runtime")
+            .enable_all()
+            .build()
+            .expect("Failed to create testing tokio runtime");
         (info, test_map, config_cache, rt)
+    }
+
+    extern "C" fn tag_socket_cb(sock: int32_t) {
+        assert!(sock >= 0);
     }
 
     #[test]
@@ -1266,25 +1058,40 @@ mod tests {
         let (info, mut test_map, config, rt) = make_testing_variables();
         rt.block_on(async {
             // Expect to make a new connection.
-            let mut doh = super::make_connection_if_needed(&info, &mut test_map, config.clone())
-                .unwrap()
-                .unwrap();
+            let mut doh = super::make_connection_if_needed(
+                &info,
+                &mut test_map,
+                config.clone(),
+                tag_socket_cb,
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(doh.info.net_id, info.net_id);
             assert!(matches!(doh.state, ConnectionState::Idle));
             doh.state = ConnectionState::Error;
             test_map.insert(info.net_id, (info.clone(), Some(doh)));
             // Expect that we will get a connection with fail status that we added to the map before.
-            let mut doh = super::make_connection_if_needed(&info, &mut test_map, config.clone())
-                .unwrap()
-                .unwrap();
+            let mut doh = super::make_connection_if_needed(
+                &info,
+                &mut test_map,
+                config.clone(),
+                tag_socket_cb,
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(doh.info.net_id, info.net_id);
             assert!(matches!(doh.state, ConnectionState::Error));
             doh.state = make_dummy_connected_state();
             test_map.insert(info.net_id, (info.clone(), Some(doh)));
             // Expect that we will get None because the map contains a connection with ready status.
-            assert!(super::make_connection_if_needed(&info, &mut test_map, config.clone())
-                .unwrap()
-                .is_none());
+            assert!(super::make_connection_if_needed(
+                &info,
+                &mut test_map,
+                config.clone(),
+                tag_socket_cb
+            )
+            .unwrap()
+            .is_none());
         });
     }
 
@@ -1328,9 +1135,14 @@ mod tests {
             // Test the connection broken case.
             test_map.clear();
             let (resp_tx, resp_rx) = oneshot::channel();
-            let mut doh = super::make_connection_if_needed(&info, &mut test_map, config.clone())
-                .unwrap()
-                .unwrap();
+            let mut doh = super::make_connection_if_needed(
+                &info,
+                &mut test_map,
+                config.clone(),
+                tag_socket_cb,
+            )
+            .unwrap()
+            .unwrap();
             doh.state = ConnectionState::Error;
             test_map.insert(info.net_id, (info.clone(), Some(doh)));
             super::handle_query_cmd(
@@ -1429,13 +1241,11 @@ mod tests {
             sk_mark: 0,
             cert_path: None,
         };
-        let rt = Arc::new(
-            Builder::new_current_thread()
-                .thread_name("test-runtime")
-                .enable_io()
-                .build()
-                .expect("Failed to create testing tokio runtime"),
-        );
+        let rt = Builder::new_current_thread()
+            .thread_name("test-runtime")
+            .enable_io()
+            .build()
+            .expect("Failed to create testing tokio runtime");
         let default_panic = std::panic::take_hook();
         // Exit the test if the worker inside tokio runtime panicked.
         std::panic::set_hook(Box::new(move |info| {
@@ -1443,30 +1253,12 @@ mod tests {
             std::process::exit(1);
         }));
         rt.block_on(async {
-            super::report_private_dns_validation(
-                &info,
-                &make_dummy_connected_state(),
-                rt.clone(),
-                success_cb,
-            );
-            super::report_private_dns_validation(
-                &info,
-                &ConnectionState::Error,
-                rt.clone(),
-                fail_cb,
-            );
-            super::report_private_dns_validation(
-                &info,
-                &make_dummy_connecting_state(),
-                rt.clone(),
-                fail_cb,
-            );
-            super::report_private_dns_validation(
-                &info,
-                &ConnectionState::Idle,
-                rt.clone(),
-                fail_cb,
-            );
+            super::report_private_dns_validation(&info, &make_dummy_connected_state(), success_cb)
+                .await;
+            super::report_private_dns_validation(&info, &ConnectionState::Error, fail_cb).await;
+            super::report_private_dns_validation(&info, &make_dummy_connecting_state(), fail_cb)
+                .await;
+            super::report_private_dns_validation(&info, &ConnectionState::Idle, fail_cb).await;
         });
     }
 
