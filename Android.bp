@@ -326,24 +326,25 @@ filegroup {
     ],
 }
 
+doh_rust_deps = [
+    "libandroid_logger",
+    "libanyhow",
+    "libbase64_rust",
+    "libfutures",
+    "liblibc",
+    "liblog_rust",
+    "libring",
+    "libtokio",
+    "liburl",
+]
+
 rust_ffi_static {
     name: "libdoh_ffi",
     crate_name: "doh",
-    srcs: ["doh.rs"],
+    srcs: ["doh/doh.rs"],
     edition: "2018",
 
-    rlibs: [
-        "libandroid_logger",
-        "libanyhow",
-        "libbase64_rust",
-        "libfutures",
-        "liblibc",
-        "liblog_rust",
-        "libquiche",
-        "libring",
-        "libtokio",
-        "liburl",
-    ],
+    rlibs: doh_rust_deps + ["libquiche"],
     prefer_rlib: true,
 
     shared_libs: [
@@ -361,25 +362,14 @@ rust_ffi_static {
 rust_test {
     name: "doh_unit_test",
     crate_name: "doh",
-    srcs: ["doh.rs"],
+    srcs: ["doh/doh.rs"],
     edition: "2018",
     test_suites: ["general-tests"],
     auto_gen_config: true,
     // Used to enable root permission for the test.
     // TODO: remove after 'require_root' is supported in rust_test.
     test_config_template: ":resolv_rust_test_config_template",
-    rustlibs: [
-        "libandroid_logger",
-        "libanyhow",
-        "libbase64_rust",
-        "libfutures",
-        "liblibc",
-        "liblog_rust",
-        "libquiche_static",
-        "libring",
-        "libtokio",
-        "liburl",
-    ],
+    rustlibs: doh_rust_deps + ["libquiche_static"],
     min_sdk_version: "29",
 }
 
@@ -387,21 +377,10 @@ rust_test {
 rust_ffi_static {
     name: "libdoh_ffi_for_test",
     crate_name: "doh",
-    srcs: ["doh.rs"],
+    srcs: ["doh/doh.rs"],
     edition: "2018",
 
-    rlibs: [
-        "libandroid_logger",
-        "libanyhow",
-        "libbase64_rust",
-        "libfutures",
-        "liblibc",
-        "liblog_rust",
-        "libquiche_static",
-        "libring",
-        "libtokio",
-        "liburl",
-    ],
+    rlibs: doh_rust_deps + ["libquiche_static"],
     prefer_rlib: true,
     // TODO(b/194022174), for unit tests to run on the Android 10 platform,
     // libunwind must be statically linked.

@@ -31,6 +31,7 @@
 #include "ResolverEventReporter.h"
 #include "doh.h"
 #include "netd_resolv/resolv.h"
+#include "resolv_cache.h"
 #include "resolv_private.h"
 #include "util.h"
 
@@ -476,6 +477,7 @@ int PrivateDnsConfiguration::setDoh(int32_t netId, uint32_t mark,
                            dohId.status);
         mPrivateDnsLog.push(std::move(record));
         LOG(INFO) << __func__ << ": Upgrading server to DoH: " << name;
+        resolv_stats_set_addrs(netId, PROTO_DOH, {dohId.ipAddr}, 443);
 
         int probeTimeout = Experiments::getInstance()->getFlag("doh_probe_timeout_ms",
                                                                kDohProbeDefaultTimeoutMs);
@@ -495,6 +497,7 @@ void PrivateDnsConfiguration::clearDohLocked(unsigned netId) {
     LOG(DEBUG) << "PrivateDnsConfiguration::clearDohLocked (" << netId << ")";
     if (mDohDispatcher != nullptr) doh_net_delete(mDohDispatcher, netId);
     mDohTracker.erase(netId);
+    resolv_stats_set_addrs(netId, PROTO_DOH, {}, 443);
 }
 
 void PrivateDnsConfiguration::clearDoh(unsigned netId) {
@@ -507,7 +510,7 @@ ssize_t PrivateDnsConfiguration::dohQuery(unsigned netId, const Slice query, con
     {
         std::lock_guard guard(mPrivateDnsLock);
         // It's safe because mDohDispatcher won't be deleted after initializing.
-        if (mDohDispatcher == nullptr) return RESULT_CAN_NOT_SEND;
+        if (mDohDispatcher == nullptr) return DOH_RESULT_CAN_NOT_SEND;
     }
     return doh_query(mDohDispatcher, netId, query.base(), query.size(), answer.base(),
                      answer.size(), timeoutMs);
