@@ -52,7 +52,6 @@
 #include <aidl/android/net/IDnsResolver.h>
 #include <android-base/logging.h>
 #include <android-base/parseint.h>
-#include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <android-base/thread_annotations.h>
 #include <android/multinetwork.h>  // ResNsendFlags
@@ -67,7 +66,7 @@
 #include "util.h"
 
 using aidl::android::net::IDnsResolver;
-using android::base::StringAppendF;
+using aidl::android::net::ResolverOptionsParcel;
 using android::net::DnsQueryEvent;
 using android::net::DnsStats;
 using android::net::Experiments;
@@ -79,6 +78,7 @@ using android::net::PROTO_UDP;
 using android::net::Protocol;
 using android::netdutils::DumpWriter;
 using android::netdutils::IPSockAddr;
+using std::span;
 
 /* This code implements a small and *simple* DNS resolver cache.
  *
@@ -774,14 +774,14 @@ static uint32_t answer_getNegativeTTL(ns_msg handle) {
  * In case of parse error zero (0) is returned which
  * indicates that the answer shall not be cached.
  */
-static uint32_t answer_getTTL(const void* answer, int answerlen) {
+static uint32_t answer_getTTL(span<const uint8_t> answer) {
     ns_msg handle;
     int ancount, n;
     uint32_t result, ttl;
     ns_rr rr;
 
     result = 0;
-    if (ns_initparse((const uint8_t*) answer, answerlen, &handle) >= 0) {
+    if (ns_initparse(answer.data(), answer.size(), &handle) >= 0) {
         // get number of answer records
         ancount = ns_msg_count(handle, ns_s_an);
 
@@ -841,13 +841,13 @@ static unsigned entry_hash(const Entry* e) {
 
 /* initialize an Entry as a search key, this also checks the input query packet
  * returns 1 on success, or 0 in case of unsupported/malformed data */
-static int entry_init_key(Entry* e, const void* query, int querylen) {
+static int entry_init_key(Entry* e, span<const uint8_t> query) {
     DnsPacket pack[1];
 
     memset(e, 0, sizeof(*e));
 
-    e->query = (const uint8_t*) query;
-    e->querylen = querylen;
+    e->query = query.data();
+    e->querylen = query.size();
     e->hash = entry_hash(e);
 
     _dnsPacket_init(pack, e->query, e->querylen);
@@ -856,11 +856,11 @@ static int entry_init_key(Entry* e, const void* query, int querylen) {
 }
 
 /* allocate a new entry as a cache node */
-static Entry* entry_alloc(const Entry* init, const void* answer, int answerlen) {
+static Entry* entry_alloc(const Entry* init, span<const uint8_t> answer) {
     Entry* e;
     int size;
 
-    size = sizeof(*e) + init->querylen + answerlen;
+    size = sizeof(*e) + init->querylen + answer.size();
     e = (Entry*) calloc(size, 1);
     if (e == NULL) return e;
 
@@ -871,9 +871,9 @@ static Entry* entry_alloc(const Entry* init, const void* answer, int answerlen) 
     memcpy((char*) e->query, init->query, e->querylen);
 
     e->answer = e->query + e->querylen;
-    e->answerlen = answerlen;
+    e->answerlen = answer.size();
 
-    memcpy((char*) e->answer, answer, e->answerlen);
+    memcpy((char*)e->answer, answer.data(), e->answerlen);
 
     return e;
 }
@@ -909,17 +909,19 @@ namespace {
 // Sampling rate varies by return code; events to log are chosen randomly, with a
 // probability proportional to the sampling rate.
 constexpr const char DEFAULT_SUBSAMPLING_MAP[] = "default:8 0:400 2:110 7:110";
+constexpr const char DEFAULT_MDNS_SUBSAMPLING_MAP[] = "default:1";
 
-std::unordered_map<int, uint32_t> resolv_get_dns_event_subsampling_map() {
+std::unordered_map<int, uint32_t> resolv_get_dns_event_subsampling_map(bool isMdns) {
     using android::base::ParseInt;
     using android::base::ParseUint;
     using android::base::Split;
     using server_configurable_flags::GetServerConfigurableFlag;
     std::unordered_map<int, uint32_t> sampling_rate_map{};
-    std::vector<std::string> subsampling_vector =
-            Split(GetServerConfigurableFlag("netd_native", "dns_event_subsample_map",
-                                            DEFAULT_SUBSAMPLING_MAP),
-                  " ");
+    const char* flag = isMdns ? "mdns_event_subsample_map" : "dns_event_subsample_map";
+    const char* defaultMap = isMdns ? DEFAULT_MDNS_SUBSAMPLING_MAP : DEFAULT_SUBSAMPLING_MAP;
+    const std::vector<std::string> subsampling_vector =
+            Split(GetServerConfigurableFlag("netd_native", flag, defaultMap), " ");
+
     for (const auto& pair : subsampling_vector) {
         std::vector<std::string> rate_denom = Split(pair, ":");
         int return_code;
@@ -1005,10 +1007,27 @@ struct Cache {
 struct NetConfig {
     explicit NetConfig(unsigned netId) : netid(netId) {
         cache = std::make_unique<Cache>();
-        dns_event_subsampling_map = resolv_get_dns_event_subsampling_map();
+        dns_event_subsampling_map = resolv_get_dns_event_subsampling_map(false);
+        mdns_event_subsampling_map = resolv_get_dns_event_subsampling_map(true);
     }
     int nameserverCount() { return nameserverSockAddrs.size(); }
+    int setOptions(const ResolverOptionsParcel& resolverOptions) {
+        customizedTable.clear();
+        for (const auto& host : resolverOptions.hosts) {
+            if (!host.hostName.empty() && !host.ipAddr.empty())
+                customizedTable.emplace(host.hostName, host.ipAddr);
+        }
 
+        if (resolverOptions.tcMode < aidl::android::net::IDnsResolver::TC_MODE_DEFAULT ||
+            resolverOptions.tcMode > aidl::android::net::IDnsResolver::TC_MODE_UDP_TCP) {
+            LOG(WARNING) << __func__ << ": netid = " << netid
+                         << ", invalid TC mode: " << resolverOptions.tcMode;
+            return -EINVAL;
+        }
+        tc_mode = resolverOptions.tcMode;
+        enforceDnsUid = resolverOptions.enforceDnsUid;
+        return 0;
+    }
     const unsigned netid;
     std::unique_ptr<Cache> cache;
     std::vector<std::string> nameservers;
@@ -1020,6 +1039,7 @@ struct NetConfig {
     int wait_for_pending_req_timeout_count = 0;
     // Map format: ReturnCode:rate_denom
     std::unordered_map<int, uint32_t> dns_event_subsampling_map;
+    std::unordered_map<int, uint32_t> mdns_event_subsampling_map;
     DnsStats dnsStats;
 
     // Customized hostname/address table will be stored in customizedTable.
@@ -1082,14 +1102,14 @@ static void cache_notify_waiting_tid_locked(struct Cache* cache, const Entry* ke
     }
 }
 
-void _resolv_cache_query_failed(unsigned netid, const void* query, int querylen, uint32_t flags) {
+void _resolv_cache_query_failed(unsigned netid, span<const uint8_t> query, uint32_t flags) {
     // We should not notify with these flags.
     if (flags & (ANDROID_RESOLV_NO_CACHE_STORE | ANDROID_RESOLV_NO_CACHE_LOOKUP)) {
         return;
     }
     Entry key[1];
 
-    if (!entry_init_key(key, query, querylen)) return;
+    if (!entry_init_key(key, query)) return;
 
     std::lock_guard guard(cache_mutex);
 
@@ -1101,11 +1121,9 @@ void _resolv_cache_query_failed(unsigned netid, const void* query, int querylen,
 }
 
 static void cache_dump_mru_locked(Cache* cache) {
-    std::string buf;
-
-    StringAppendF(&buf, "MRU LIST (%2d): ", cache->num_entries);
+    std::string buf = fmt::format("MRU LIST ({:2d}): ", cache->num_entries);
     for (Entry* e = cache->mru_list.mru_next; e != &cache->mru_list; e = e->mru_next) {
-        StringAppendF(&buf, " %d", e->id);
+        fmt::format_to(std::back_inserter(buf), " {}", e->id);
     }
 
     LOG(INFO) << __func__ << ": " << buf;
@@ -1182,7 +1200,7 @@ static void _cache_remove_oldest(Cache* cache) {
         return;
     }
     LOG(INFO) << __func__ << ": Cache full - removing oldest";
-    res_pquery(oldest->query, oldest->querylen);
+    res_pquery({oldest->query, oldest->querylen});
     _cache_remove_p(cache, lookup);
 }
 
@@ -1211,8 +1229,8 @@ static void _cache_remove_expired(Cache* cache) {
 // Get a NetConfig associated with a network, or nullptr if not found.
 static NetConfig* find_netconfig_locked(unsigned netid) REQUIRES(cache_mutex);
 
-ResolvCacheStatus resolv_cache_lookup(unsigned netid, const void* query, int querylen, void* answer,
-                                      int answersize, int* answerlen, uint32_t flags) {
+ResolvCacheStatus resolv_cache_lookup(unsigned netid, span<const uint8_t> query,
+                                      span<uint8_t> answer, int* answerlen, uint32_t flags) {
     // Skip cache lookup, return RESOLV_CACHE_NOTFOUND directly so that it is
     // possible to cache the answer of this query.
     // If ANDROID_RESOLV_NO_CACHE_STORE is set, return RESOLV_CACHE_SKIP to skip possible cache
@@ -1230,7 +1248,7 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, const void* query, int que
     LOG(INFO) << __func__ << ": lookup";
 
     /* we don't cache malformed queries */
-    if (!entry_init_key(&key, query, querylen)) {
+    if (!entry_init_key(&key, query)) {
         LOG(INFO) << __func__ << ": unsupported query";
         return RESOLV_CACHE_UNSUPPORTED;
     }
@@ -1287,19 +1305,19 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, const void* query, int que
     /* remove stale entries here */
     if (now >= e->expires) {
         LOG(INFO) << __func__ << ": NOT IN CACHE (STALE ENTRY " << *lookup << "DISCARDED)";
-        res_pquery(e->query, e->querylen);
+        res_pquery({e->query, e->querylen});
         _cache_remove_p(cache, lookup);
         return RESOLV_CACHE_NOTFOUND;
     }
 
     *answerlen = e->answerlen;
-    if (e->answerlen > answersize) {
+    if (e->answerlen > answer.size()) {
         /* NOTE: we return UNSUPPORTED if the answer buffer is too short */
         LOG(INFO) << __func__ << ": ANSWER TOO LONG";
         return RESOLV_CACHE_UNSUPPORTED;
     }
 
-    memcpy(answer, e->answer, e->answerlen);
+    memcpy(answer.data(), e->answer, e->answerlen);
 
     /* bump up this entry to the top of the MRU list */
     if (e != cache->mru_list.mru_next) {
@@ -1311,8 +1329,7 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, const void* query, int que
     return RESOLV_CACHE_FOUND;
 }
 
-int resolv_cache_add(unsigned netid, const void* query, int querylen, const void* answer,
-                     int answerlen) {
+int resolv_cache_add(unsigned netid, span<const uint8_t> query, span<const uint8_t> answer) {
     Entry key[1];
     Entry* e;
     Entry** lookup;
@@ -1321,7 +1338,7 @@ int resolv_cache_add(unsigned netid, const void* query, int querylen, const void
 
     /* don't assume that the query has already been cached
      */
-    if (!entry_init_key(key, query, querylen)) {
+    if (!entry_init_key(key, query)) {
         LOG(INFO) << __func__ << ": passed invalid query?";
         return -EINVAL;
     }
@@ -1358,9 +1375,9 @@ int resolv_cache_add(unsigned netid, const void* query, int querylen, const void
         }
     }
 
-    ttl = answer_getTTL(answer, answerlen);
+    ttl = answer_getTTL(answer);
     if (ttl > 0) {
-        e = entry_alloc(key, answer, answerlen);
+        e = entry_alloc(key, answer);
         if (e != NULL) {
             e->expires = ttl + _time_now();
             _cache_add_p(cache, lookup, e);
@@ -1606,7 +1623,7 @@ std::vector<std::string> getCustomizedTableByName(const size_t netid, const char
 
 int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& servers,
                            const std::vector<std::string>& domains, const res_params& params,
-                           const aidl::android::net::ResolverOptionsParcel& resolverOptions,
+                           const std::optional<ResolverOptionsParcel> optionalResolverOptions,
                            const std::vector<int32_t>& transportTypes) {
     std::vector<std::string> nameservers = filter_nameservers(servers);
     const int numservers = static_cast<int>(nameservers.size());
@@ -1660,24 +1677,20 @@ int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& serve
         LOG(WARNING) << __func__ << ": netid = " << netid << ", failed to set dns stats";
         return -EINVAL;
     }
-    netconfig->customizedTable.clear();
-    for (const auto& host : resolverOptions.hosts) {
-        if (!host.hostName.empty() && !host.ipAddr.empty())
-            netconfig->customizedTable.emplace(host.hostName, host.ipAddr);
-    }
-
-    if (resolverOptions.tcMode < aidl::android::net::IDnsResolver::TC_MODE_DEFAULT ||
-        resolverOptions.tcMode > aidl::android::net::IDnsResolver::TC_MODE_UDP_TCP) {
-        LOG(WARNING) << __func__ << ": netid = " << netid
-                     << ", invalid TC mode: " << resolverOptions.tcMode;
-        return -EINVAL;
-    }
-    netconfig->tc_mode = resolverOptions.tcMode;
-    netconfig->enforceDnsUid = resolverOptions.enforceDnsUid;
-
     netconfig->transportTypes = transportTypes;
-
+    if (optionalResolverOptions.has_value()) {
+        const ResolverOptionsParcel& resolverOptions = optionalResolverOptions.value();
+        return netconfig->setOptions(resolverOptions);
+    }
     return 0;
+}
+
+int resolv_set_options(unsigned netid, const ResolverOptionsParcel& options) {
+    std::lock_guard guard(cache_mutex);
+    NetConfig* netconfig = find_netconfig_locked(netid);
+
+    if (netconfig == nullptr) return -ENONET;
+    return netconfig->setOptions(options);
 }
 
 static bool resolv_is_nameservers_equal(const std::vector<std::string>& oldServers,
@@ -1781,18 +1794,20 @@ int android_net_res_stats_get_info_for_net(unsigned netid, int* nscount,
     return info->revision_id;
 }
 
-std::vector<std::string> resolv_cache_dump_subsampling_map(unsigned netid) {
-    using android::base::StringPrintf;
+std::vector<std::string> resolv_cache_dump_subsampling_map(unsigned netid, bool is_mdns) {
     std::lock_guard guard(cache_mutex);
     NetConfig* netconfig = find_netconfig_locked(netid);
     if (netconfig == nullptr) return {};
     std::vector<std::string> result;
-    for (const auto& pair : netconfig->dns_event_subsampling_map) {
-        result.push_back(StringPrintf("%s:%d",
-                                      (pair.first == DNSEVENT_SUBSAMPLING_MAP_DEFAULT_KEY)
-                                              ? "default"
-                                              : std::to_string(pair.first).c_str(),
-                                      pair.second));
+    const auto& subsampling_map = (!is_mdns) ? netconfig->dns_event_subsampling_map
+                                             : netconfig->mdns_event_subsampling_map;
+    result.reserve(subsampling_map.size());
+    for (const auto& [return_code, rate_denom] : subsampling_map) {
+        result.push_back(fmt::format("{}:{}",
+                                     (return_code == DNSEVENT_SUBSAMPLING_MAP_DEFAULT_KEY)
+                                             ? "default"
+                                             : std::to_string(return_code),
+                                     rate_denom));
     }
     return result;
 }
@@ -1801,11 +1816,12 @@ std::vector<std::string> resolv_cache_dump_subsampling_map(unsigned netid) {
 // a sampling factor derived from the netid and the return code.
 //
 // Returns the subsampling rate if the event should be sampled, or 0 if it should be discarded.
-uint32_t resolv_cache_get_subsampling_denom(unsigned netid, int return_code) {
+uint32_t resolv_cache_get_subsampling_denom(unsigned netid, int return_code, bool is_mdns) {
     std::lock_guard guard(cache_mutex);
     NetConfig* netconfig = find_netconfig_locked(netid);
     if (netconfig == nullptr) return 0;  // Don't log anything at all.
-    const auto& subsampling_map = netconfig->dns_event_subsampling_map;
+    const auto& subsampling_map = (!is_mdns) ? netconfig->dns_event_subsampling_map
+                                             : netconfig->mdns_event_subsampling_map;
     auto search_returnCode = subsampling_map.find(return_code);
     uint32_t denom;
     if (search_returnCode != subsampling_map.end()) {
@@ -1870,13 +1886,12 @@ bool has_named_cache(unsigned netid) {
     return find_named_cache_locked(netid) != nullptr;
 }
 
-int resolv_cache_get_expiration(unsigned netid, const std::vector<char>& query,
-                                time_t* expiration) {
+int resolv_cache_get_expiration(unsigned netid, span<const uint8_t> query, time_t* expiration) {
     Entry key;
     *expiration = -1;
 
     // A malformed query is not allowed.
-    if (!entry_init_key(&key, query.data(), query.size())) {
+    if (!entry_init_key(&key, query)) {
         LOG(WARNING) << __func__ << ": unsupported query";
         return -EINVAL;
     }

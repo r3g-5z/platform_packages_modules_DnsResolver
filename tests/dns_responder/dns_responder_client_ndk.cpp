@@ -30,6 +30,7 @@ static const char* ANDROID_DNS_MODE = "ANDROID_DNS_MODE";
 
 using aidl::android::net::IDnsResolver;
 using aidl::android::net::INetd;
+using aidl::android::net::ResolverOptionsParcel;
 using aidl::android::net::ResolverParamsParcel;
 using android::net::ResolverStats;
 
@@ -39,10 +40,10 @@ void DnsResponderClient::SetupMappings(unsigned numHosts, const std::vector<std:
     auto mappingsIt = mappings->begin();
     for (unsigned i = 0; i < numHosts; ++i) {
         for (const auto& domain : domains) {
-            mappingsIt->host = StringPrintf("host%u", i);
-            mappingsIt->entry = StringPrintf("%s.%s.", mappingsIt->host.c_str(), domain.c_str());
-            mappingsIt->ip4 = StringPrintf("192.0.2.%u", i % 253 + 1);
-            mappingsIt->ip6 = StringPrintf("2001:db8::%x", i % 65534 + 1);
+            mappingsIt->host = fmt::format("host{}", i);
+            mappingsIt->entry = fmt::format("{}.{}.", mappingsIt->host, domain);
+            mappingsIt->ip4 = fmt::format("192.0.2.{}", i % 253 + 1);
+            mappingsIt->ip6 = fmt::format("2001:db8::{:x}", i % 65534 + 1);
             ++mappingsIt;
         }
     }
@@ -77,6 +78,7 @@ ResolverParamsParcel DnsResponderClient::makeResolverParamsParcel(
     paramsParcel.tlsServers = tlsServers;
     paramsParcel.tlsFingerprints = {};
     paramsParcel.caCertificate = caCert;
+    paramsParcel.resolverOptions = ResolverOptionsParcel{};  // optional, must be explicitly set.
 
     // Note, do not remove this otherwise the ResolverTest#ConnectTlsServerTimeout won't pass in M4
     // module.
@@ -160,7 +162,7 @@ void DnsResponderClient::SetupDNSServers(unsigned numServers, const std::vector<
     for (unsigned i = 0; i < numServers; ++i) {
         auto& server = (*servers)[i];
         auto& d = (*dns)[i];
-        server = StringPrintf("127.0.0.%u", i + 100);
+        server = fmt::format("127.0.0.{}", i + 100);
         d = std::make_unique<test::DNSResponder>(server, listenSrv, ns_rcode::ns_r_servfail);
         for (const auto& mapping : mappings) {
             d->addMapping(mapping.entry.c_str(), ns_type::ns_t_a, mapping.ip4.c_str());

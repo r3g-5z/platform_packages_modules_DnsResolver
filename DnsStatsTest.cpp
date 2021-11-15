@@ -117,7 +117,8 @@ class DnsStatsTest : public ::testing::Test {
     void verifyDumpOutput(const std::vector<StatsData>& tcpData,
                           const std::vector<StatsData>& udpData,
                           const std::vector<StatsData>& dotData,
-                          const std::vector<StatsData>& mdnsData) {
+                          const std::vector<StatsData>& mdnsData,
+                          const std::vector<StatsData>& dohData) {
         // A pattern to capture three matches:
         //     server address (empty allowed), the statistics, and the score.
         const std::regex pattern(R"(\s{4,}([0-9a-fA-F:\.]*)[ ]?([<(].*[>)])[ ]?(\S*))");
@@ -141,7 +142,8 @@ class DnsStatsTest : public ::testing::Test {
 
             for (const auto& stats : statsData) {
                 ASSERT_TRUE(std::regex_search(*dumpString, sm, pattern));
-                EXPECT_EQ(sm[1], stats.sockAddr.ip().toString());
+                EXPECT_EQ(sm[1], stats.sockAddr.ip().toString() + ":" +
+                                         std::to_string(stats.sockAddr.port()));
                 EXPECT_FALSE(sm[2].str().empty());
                 EXPECT_FALSE(sm[3].str().empty());
                 *dumpString = sm.suffix();
@@ -149,6 +151,7 @@ class DnsStatsTest : public ::testing::Test {
         };
 
         check(udpData, "UDP", &dumpString);
+        check(dohData, "DOH", &dumpString);
         check(dotData, "TLS", &dumpString);
         check(tcpData, "TCP", &dumpString);
         check(mdnsData, "MDNS", &dumpString);
@@ -173,7 +176,7 @@ class DnsStatsTest : public ::testing::Test {
 
 TEST_F(DnsStatsTest, SetAddrs) {
     // Check before any operation to mDnsStats.
-    verifyDumpOutput({}, {}, {}, {});
+    verifyDumpOutput({}, {}, {}, {}, {});
 
     static const struct {
         std::vector<std::string> servers;
@@ -230,15 +233,15 @@ TEST_F(DnsStatsTest, SetAddrs) {
         EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_DOT, expectedStats, NO_AVERAGE_LATENCY));
     }
 
-    verifyDumpOutput({}, {}, {}, {});
+    verifyDumpOutput({}, {}, {}, {}, {});
 }
 
 TEST_F(DnsStatsTest, SetServersDifferentPorts) {
     const std::vector<IPSockAddr> servers = {
-            IPSockAddr::toIPSockAddr("127.0.0.1", 0),   IPSockAddr::toIPSockAddr("fe80::1", 0),
-            IPSockAddr::toIPSockAddr("127.0.0.1", 53),  IPSockAddr::toIPSockAddr("127.0.0.1", 5353),
-            IPSockAddr::toIPSockAddr("127.0.0.1", 853), IPSockAddr::toIPSockAddr("fe80::1", 53),
-            IPSockAddr::toIPSockAddr("fe80::1", 5353),  IPSockAddr::toIPSockAddr("fe80::1", 853),
+            IPSockAddr::toIPSockAddr("127.0.0.1", 0),    IPSockAddr::toIPSockAddr("fe80::1", 0),
+            IPSockAddr::toIPSockAddr("127.0.0.1", 53),   IPSockAddr::toIPSockAddr("127.0.0.1", 853),
+            IPSockAddr::toIPSockAddr("127.0.0.1", 5353), IPSockAddr::toIPSockAddr("fe80::1", 53),
+            IPSockAddr::toIPSockAddr("fe80::1", 853),    IPSockAddr::toIPSockAddr("fe80::1", 5353),
     };
 
     // Servers setup fails due to port unset.
@@ -249,7 +252,7 @@ TEST_F(DnsStatsTest, SetServersDifferentPorts) {
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_TCP, {}, NO_AVERAGE_LATENCY));
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_UDP, {}, NO_AVERAGE_LATENCY));
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_DOT, {}, NO_AVERAGE_LATENCY));
-    verifyDumpOutput({}, {}, {}, {});
+    verifyDumpOutput({}, {}, {}, {}, {});
 
     EXPECT_TRUE(mDnsStats.setAddrs(std::vector(servers.begin() + 2, servers.end()), PROTO_TCP));
     EXPECT_TRUE(mDnsStats.setAddrs(std::vector(servers.begin() + 2, servers.end()), PROTO_UDP));
@@ -264,7 +267,7 @@ TEST_F(DnsStatsTest, SetServersDifferentPorts) {
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_TCP, expectedStats, NO_AVERAGE_LATENCY));
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_UDP, expectedStats, NO_AVERAGE_LATENCY));
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_DOT, expectedStats, NO_AVERAGE_LATENCY));
-    verifyDumpOutput(expectedStats, expectedStats, expectedStats, {});
+    verifyDumpOutput(expectedStats, expectedStats, expectedStats, {}, {});
 }
 
 TEST_F(DnsStatsTest, AddStatsAndClear) {
@@ -311,7 +314,7 @@ TEST_F(DnsStatsTest, AddStatsAndClear) {
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_UDP, expectedStatsForUdp, 10ms));
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_DOT, {}, NO_AVERAGE_LATENCY));
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_MDNS, expectedStatsForMdns, 10ms));
-    verifyDumpOutput(expectedStatsForTcp, expectedStatsForUdp, {}, expectedStatsForMdns);
+    verifyDumpOutput(expectedStatsForTcp, expectedStatsForUdp, {}, expectedStatsForMdns, {});
 
     // Clear stats.
     EXPECT_TRUE(mDnsStats.setAddrs({}, PROTO_TCP));
@@ -322,7 +325,7 @@ TEST_F(DnsStatsTest, AddStatsAndClear) {
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_UDP, {}, NO_AVERAGE_LATENCY));
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_DOT, {}, NO_AVERAGE_LATENCY));
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_MDNS, {}, NO_AVERAGE_LATENCY));
-    verifyDumpOutput({}, {}, {}, {});
+    verifyDumpOutput({}, {}, {}, {}, {});
 }
 
 TEST_F(DnsStatsTest, StatsRemainsInExistentServer) {
@@ -350,7 +353,7 @@ TEST_F(DnsStatsTest, StatsRemainsInExistentServer) {
     };
     EXPECT_THAT(mDnsStats.getStats(PROTO_UDP), UnorderedElementsAreArray(expectedStats));
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_UDP, expectedStats, 106ms));
-    verifyDumpOutput({}, expectedStats, {}, {});
+    verifyDumpOutput({}, expectedStats, {}, {}, {});
 
     // Update the server list, the stats of 127.0.0.2 will remain.
     servers = {
@@ -366,7 +369,7 @@ TEST_F(DnsStatsTest, StatsRemainsInExistentServer) {
     };
     EXPECT_THAT(mDnsStats.getStats(PROTO_UDP), UnorderedElementsAreArray(expectedStats));
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_UDP, expectedStats, 130ms));
-    verifyDumpOutput({}, expectedStats, {}, {});
+    verifyDumpOutput({}, expectedStats, {}, {}, {});
 
     // Let's add a record to 127.0.0.2 again.
     EXPECT_TRUE(mDnsStats.addStats(servers[0], recordNoError));
@@ -377,7 +380,7 @@ TEST_F(DnsStatsTest, StatsRemainsInExistentServer) {
     };
     EXPECT_THAT(mDnsStats.getStats(PROTO_UDP), UnorderedElementsAreArray(expectedStats));
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_UDP, expectedStats, 106ms));
-    verifyDumpOutput({}, expectedStats, {}, {});
+    verifyDumpOutput({}, expectedStats, {}, {}, {});
 }
 
 TEST_F(DnsStatsTest, AddStatsRecords_100000) {
@@ -451,7 +454,7 @@ TEST_F(DnsStatsTest, AddStatsRecords_100000) {
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_UDP, expectedStats, 99935500us));
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_DOT, expectedStats, 99935500us));
     EXPECT_NO_FAILURE(verifyDnsStatsContent(PROTO_MDNS, expectedMdnsStats, 99935500us));
-    verifyDumpOutput(expectedStats, expectedStats, expectedStats, expectedMdnsStats);
+    verifyDumpOutput(expectedStats, expectedStats, expectedStats, expectedMdnsStats, {});
 }
 
 TEST_F(DnsStatsTest, GetServers_SortingByLatency) {
