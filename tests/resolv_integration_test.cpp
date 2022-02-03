@@ -226,8 +226,8 @@ class ResolverTest : public ::testing::Test {
     }
 
     void resetNetwork() {
-        mDnsClient.TearDown();
-        mDnsClient.SetupOemNetwork();
+        EXPECT_EQ(mDnsClient.TearDownOemNetwork(TEST_NETID), 0);
+        EXPECT_EQ(mDnsClient.SetupOemNetwork(TEST_NETID), 0);
     }
 
     void StartDns(test::DNSResponder& dns, const std::vector<DnsRecord>& records) {
@@ -5937,8 +5937,8 @@ TEST_F(ResolverTest, DnsServerSelection) {
     test::DNSResponder dns3("127.0.0.5");
 
     dns1.setResponseDelayMs(10);
-    dns2.setResponseDelayMs(25);
-    dns3.setResponseDelayMs(50);
+    dns2.setResponseDelayMs(50);
+    dns3.setResponseDelayMs(100);
     StartDns(dns1, {{kHelloExampleCom, ns_type::ns_t_a, kHelloExampleComAddrV4}});
     StartDns(dns2, {{kHelloExampleCom, ns_type::ns_t_a, kHelloExampleComAddrV4}});
     StartDns(dns3, {{kHelloExampleCom, ns_type::ns_t_a, kHelloExampleComAddrV4}});
