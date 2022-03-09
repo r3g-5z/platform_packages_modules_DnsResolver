@@ -744,6 +744,7 @@ TEST_F(PrivateDnsDohTest, ExcessDnsRequests) {
     for (const auto& fd : fds) {
         expectAnswersValid(fd, AF_INET6, kQueryAnswerAAAA);
     }
+    EXPECT_TRUE(doh.block_sending(false));
 
     // There are some queries that fall back to DoT rather than UDP since the DoH client rejects
     // any new DNS requests when the capacity is full.
@@ -780,6 +781,21 @@ TEST_F(PrivateDnsDohTest, ExcessDnsRequests) {
     // Expect two queries: one for DoH probe and the other one for kQueryHostname.
     EXPECT_EQ(doh_ipv6.queries(), 2);
     mDnsClient.TearDownOemNetwork(TEST_NETID_2);
+
+    // The DnsResolver will reconnect to the DoH server for the query that gets blocked at
+    // dispatcher sending channel. However, there's no way to know when the reconnection will start.
+    // We have to periodically send a DNS request to check it. After the reconnection starts, the
+    // DNS query will be sent to the Doh server instead of the cleartext DNS server. Then, we
+    // are safe to end the test. Otherwise, the reconnection will interfere other tests.
+    EXPECT_EQ(doh.queries(), 0);
+    for (int i = 0; i < 50; i++) {
+        sleep_for(milliseconds(100));
+        int fd = resNetworkQuery(TEST_NETID, kQueryHostname, ns_c_in, ns_t_aaaa,
+                                 ANDROID_RESOLV_NO_CACHE_LOOKUP);
+        expectAnswersValid(fd, AF_INET6, kQueryAnswerAAAA);
+        if (doh.queries() > 0) break;
+    }
+    EXPECT_GT(doh.queries(), 0);
 }
 
 // Tests the scenario where the DnsResolver runs out of QUIC connection data limit.
@@ -958,7 +974,14 @@ TEST_F(PrivateDnsDohTest, ConnectionIdleTimer) {
 TEST_F(PrivateDnsDohTest, SessionResumption) {
     const int initial_max_idle_timeout_ms = 1000;
     for (const auto& flag : {"0", "1"}) {
+        SCOPED_TRACE(fmt::format("flag: {}", flag));
         auto sp = make_unique<ScopedSystemProperties>(kDohSessionResumptionFlag, flag);
+
+        // Each loop takes around 3 seconds, if the system property "doh" is reset in the middle
+        // of the first loop, this test will fail when running the second loop because DnsResolver
+        // updates its "doh" flag when resetNetwork() is called. Therefore, add another
+        // ScopedSystemProperties for "doh" to make the test more robust.
+        auto sp2 = make_unique<ScopedSystemProperties>(kDohFlag, "1");
         resetNetwork();
 
         ASSERT_TRUE(doh.stopServer());
@@ -1013,6 +1036,8 @@ TEST_F(PrivateDnsDohTest, RemoteConnectionClosed) {
     // Make the server close the connection. This will also reset the stats, so the doh query
     // count below is still 2 rather than 4.
     ASSERT_TRUE(doh.stopServer());
+    // Sleep a while to avoid binding socket failed.
+    sleep_for(milliseconds(100));
     ASSERT_TRUE(doh.startServer());
 
     EXPECT_NO_FAILURE(sendQueryAndCheckResult());
