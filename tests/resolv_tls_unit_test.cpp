@@ -41,29 +41,53 @@
 namespace android {
 namespace net {
 
-using netdutils::IPAddress;
-using netdutils::IPSockAddr;
 using netdutils::makeSlice;
 using netdutils::Slice;
 
+static const std::string DOT_MAXTRIES_FLAG = "dot_maxtries";
+
 typedef std::vector<uint8_t> bytevec;
 
-static const std::string DOT_MAXTRIES_FLAG = "dot_maxtries";
-static const std::string SERVERNAME1 = "dns.example.com";
-static const std::string SERVERNAME2 = "dns.example.org";
-static const IPAddress V4ADDR1 = IPAddress::forString("192.0.2.1");
-static const IPAddress V4ADDR2 = IPAddress::forString("192.0.2.2");
-static const IPAddress V6ADDR1 = IPAddress::forString("2001:db8::1");
-static const IPAddress V6ADDR2 = IPAddress::forString("2001:db8::2");
+static void parseServer(const char* server, in_port_t port, sockaddr_storage* parsed) {
+    sockaddr_in* sin = reinterpret_cast<sockaddr_in*>(parsed);
+    if (inet_pton(AF_INET, server, &(sin->sin_addr)) == 1) {
+        // IPv4 parse succeeded, so it's IPv4
+        sin->sin_family = AF_INET;
+        sin->sin_port = htons(port);
+        return;
+    }
+    sockaddr_in6* sin6 = reinterpret_cast<sockaddr_in6*>(parsed);
+    if (inet_pton(AF_INET6, server, &(sin6->sin6_addr)) == 1){
+        // IPv6 parse succeeded, so it's IPv6.
+        sin6->sin6_family = AF_INET6;
+        sin6->sin6_port = htons(port);
+        return;
+    }
+    LOG(ERROR) << "Failed to parse server address: " << server;
+}
+
+std::string SERVERNAME1 = "dns.example.com";
+std::string SERVERNAME2 = "dns.example.org";
 
 // BaseTest just provides constants that are useful for the tests.
 class BaseTest : public ::testing::Test {
   protected:
     BaseTest() {
+        parseServer("192.0.2.1", 853, &V4ADDR1);
+        parseServer("192.0.2.2", 853, &V4ADDR2);
+        parseServer("2001:db8::1", 853, &V6ADDR1);
+        parseServer("2001:db8::2", 853, &V6ADDR2);
+
+        SERVER1 = DnsTlsServer(V4ADDR1);
         SERVER1.name = SERVERNAME1;
     }
 
-    DnsTlsServer SERVER1{V4ADDR1};
+    sockaddr_storage V4ADDR1;
+    sockaddr_storage V4ADDR2;
+    sockaddr_storage V6ADDR1;
+    sockaddr_storage V6ADDR2;
+
+    DnsTlsServer SERVER1;
 };
 
 bytevec make_query(uint16_t id, size_t size) {
@@ -793,23 +817,26 @@ void checkEqual(const DnsTlsServer& s1, const DnsTlsServer& s2) {
 class ServerTest : public BaseTest {};
 
 TEST_F(ServerTest, IPv4) {
-    checkUnequal(DnsTlsServer(V4ADDR1), DnsTlsServer(V4ADDR2));
-    EXPECT_FALSE(isAddressEqual(DnsTlsServer(V4ADDR1), DnsTlsServer(V4ADDR2)));
+    checkUnequal(V4ADDR1, V4ADDR2);
+    EXPECT_FALSE(isAddressEqual(V4ADDR1, V4ADDR2));
 }
 
 TEST_F(ServerTest, IPv6) {
-    checkUnequal(DnsTlsServer(V6ADDR1), DnsTlsServer(V6ADDR2));
-    EXPECT_FALSE(isAddressEqual(DnsTlsServer(V6ADDR1), DnsTlsServer(V6ADDR2)));
+    checkUnequal(V6ADDR1, V6ADDR2);
+    EXPECT_FALSE(isAddressEqual(V6ADDR1, V6ADDR2));
 }
 
 TEST_F(ServerTest, MixedAddressFamily) {
-    checkUnequal(DnsTlsServer(V6ADDR1), DnsTlsServer(V4ADDR1));
-    EXPECT_FALSE(isAddressEqual(DnsTlsServer(V6ADDR1), DnsTlsServer(V4ADDR1)));
+    checkUnequal(V6ADDR1, V4ADDR1);
+    EXPECT_FALSE(isAddressEqual(V6ADDR1, V4ADDR1));
 }
 
 TEST_F(ServerTest, IPv6ScopeId) {
-    DnsTlsServer s1(IPAddress::forString("fe80::1%1"));
-    DnsTlsServer s2(IPAddress::forString("fe80::1%2"));
+    DnsTlsServer s1(V6ADDR1), s2(V6ADDR1);
+    sockaddr_in6* addr1 = reinterpret_cast<sockaddr_in6*>(&s1.ss);
+    addr1->sin6_scope_id = 1;
+    sockaddr_in6* addr2 = reinterpret_cast<sockaddr_in6*>(&s2.ss);
+    addr2->sin6_scope_id = 2;
     checkUnequal(s1, s2);
     EXPECT_FALSE(isAddressEqual(s1, s2));
 
@@ -817,16 +844,32 @@ TEST_F(ServerTest, IPv6ScopeId) {
     EXPECT_FALSE(s2.wasExplicitlyConfigured());
 }
 
+TEST_F(ServerTest, IPv6FlowInfo) {
+    DnsTlsServer s1(V6ADDR1), s2(V6ADDR1);
+    sockaddr_in6* addr1 = reinterpret_cast<sockaddr_in6*>(&s1.ss);
+    addr1->sin6_flowinfo = 1;
+    sockaddr_in6* addr2 = reinterpret_cast<sockaddr_in6*>(&s2.ss);
+    addr2->sin6_flowinfo = 2;
+    // All comparisons ignore flowinfo.
+    EXPECT_EQ(s1, s2);
+    EXPECT_TRUE(isAddressEqual(s1, s2));
+
+    EXPECT_FALSE(s1.wasExplicitlyConfigured());
+    EXPECT_FALSE(s2.wasExplicitlyConfigured());
+}
+
 TEST_F(ServerTest, Port) {
-    DnsTlsServer s1(IPSockAddr::toIPSockAddr("192.0.2.1", 853));
-    DnsTlsServer s2(IPSockAddr::toIPSockAddr("192.0.2.1", 854));
+    DnsTlsServer s1, s2;
+    parseServer("192.0.2.1", 853, &s1.ss);
+    parseServer("192.0.2.1", 854, &s2.ss);
     checkUnequal(s1, s2);
     EXPECT_TRUE(isAddressEqual(s1, s2));
     EXPECT_EQ(s1.toIpString(), "192.0.2.1");
     EXPECT_EQ(s2.toIpString(), "192.0.2.1");
 
-    DnsTlsServer s3(IPSockAddr::toIPSockAddr("2001:db8::1", 853));
-    DnsTlsServer s4(IPSockAddr::toIPSockAddr("2001:db8::1", 854));
+    DnsTlsServer s3, s4;
+    parseServer("2001:db8::1", 853, &s3.ss);
+    parseServer("2001:db8::1", 852, &s4.ss);
     checkUnequal(s3, s4);
     EXPECT_TRUE(isAddressEqual(s3, s4));
     EXPECT_EQ(s3.toIpString(), "2001:db8::1");
@@ -974,6 +1017,8 @@ class DnsTlsSocketTest : public ::testing::Test {
         MOCK_METHOD(void, onResponse, (std::vector<uint8_t>), (override));
     };
 
+    DnsTlsSocketTest() { parseServer(kTlsAddr, std::stoi(kTlsPort), &server.ss); }
+
     std::unique_ptr<DnsTlsSocket> makeDnsTlsSocket(IDnsTlsSocketObserver* observer) {
         return std::make_unique<DnsTlsSocket>(this->server, MARK, observer, &this->cache);
     }
@@ -992,7 +1037,7 @@ class DnsTlsSocketTest : public ::testing::Test {
 
     test::DnsTlsFrontend tls{kTlsAddr, kTlsPort, kBackendAddr, kBackendPort};
 
-    const DnsTlsServer server{IPSockAddr::toIPSockAddr(kTlsAddr, std::stoi(kTlsPort))};
+    DnsTlsServer server;
     DnsTlsSessionCache cache;
 };
 

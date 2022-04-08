@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -51,8 +50,8 @@ void resolv_populate_res_for_net(ResState* statp);
 
 std::vector<unsigned> resolv_list_caches();
 
-std::vector<std::string> resolv_cache_dump_subsampling_map(unsigned netid, bool is_mdns);
-uint32_t resolv_cache_get_subsampling_denom(unsigned netid, int return_code, bool is_mdns);
+std::vector<std::string> resolv_cache_dump_subsampling_map(unsigned netid);
+uint32_t resolv_cache_get_subsampling_denom(unsigned netid, int return_code);
 
 typedef enum {
     RESOLV_CACHE_UNSUPPORTED, /* the cache can't handle that kind of queries */
@@ -62,16 +61,16 @@ typedef enum {
     RESOLV_CACHE_SKIP         /* Don't do anything on cache */
 } ResolvCacheStatus;
 
-ResolvCacheStatus resolv_cache_lookup(unsigned netid, std::span<const uint8_t> query,
-                                      std::span<uint8_t> answer, int* answerlen, uint32_t flags);
+ResolvCacheStatus resolv_cache_lookup(unsigned netid, const void* query, int querylen, void* answer,
+                                      int answersize, int* answerlen, uint32_t flags);
 
 // add a (query,answer) to the cache. If the pair has been in the cache, no new entry will be added
 // in the cache.
-int resolv_cache_add(unsigned netid, std::span<const uint8_t> query,
-                     std::span<const uint8_t> answer);
+int resolv_cache_add(unsigned netid, const void* query, int querylen, const void* answer,
+                     int answerlen);
 
 /* Notify the cache a request failed */
-void _resolv_cache_query_failed(unsigned netid, std::span<const uint8_t> query, uint32_t flags);
+void _resolv_cache_query_failed(unsigned netid, const void* query, int querylen, uint32_t flags);
 
 // Get a customized table for a given network.
 std::vector<std::string> getCustomizedTableByName(const size_t netid, const char* hostname);
@@ -80,11 +79,11 @@ std::vector<std::string> getCustomizedTableByName(const size_t netid, const char
 // TODO: Pass all of ResolverParamsParcel and remove the res_params argument.
 int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& servers,
                            const std::vector<std::string>& domains, const res_params& params,
-                           std::optional<aidl::android::net::ResolverOptionsParcel> resolverOptions,
+                           const aidl::android::net::ResolverOptionsParcel& resolverOptions =
+                                   {{} /* hosts */,
+                                    aidl::android::net::IDnsResolver::TC_MODE_DEFAULT,
+                                    false /* enforceDnsUid */},
                            const std::vector<int32_t>& transportTypes = {});
-
-// Sets options for a given network.
-int resolv_set_options(unsigned netid, const aidl::android::net::ResolverOptionsParcel& options);
 
 // Creates the cache associated with the given network.
 int resolv_create_cache_for_net(unsigned netid);
@@ -104,11 +103,10 @@ bool has_named_cache(unsigned netid);
 // For test only.
 // Get the expiration time of a cache entry. Return 0 on success; otherwise, an negative error is
 // returned if the expiration time can't be acquired.
-int resolv_cache_get_expiration(unsigned netid, std::span<const uint8_t> query, time_t* expiration);
+int resolv_cache_get_expiration(unsigned netid, const std::vector<char>& query, time_t* expiration);
 
-// Set addresses to DnsStats for a given network.
-int resolv_stats_set_addrs(unsigned netid, android::net::Protocol proto,
-                           const std::vector<std::string>& addrs, int port);
+// Set private DNS servers to DnsStats for a given network.
+int resolv_stats_set_servers_for_dot(unsigned netid, const std::vector<std::string>& servers);
 
 // Add a statistics record to DnsStats for a given network.
 bool resolv_stats_add(unsigned netid, const android::netdutils::IPSockAddr& server,

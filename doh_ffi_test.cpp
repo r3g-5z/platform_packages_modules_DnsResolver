@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019 The Android Open Source Project
+ * Copyright (C) 2020 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,18 +14,20 @@
  * limitations under the License.
  */
 
-#pragma once
+#include "doh.h"
 
-#include <stdint.h>
+#include <gmock/gmock-matchers.h>
+#include <gtest/gtest.h>
 
-// TODO: use netdutils::Slice for (msg, len).
-void res_pquery(const uint8_t* msg, int len);
+TEST(DoHFFITest, SmokeTest) {
+    EXPECT_STREQ(doh_init(), "1.0");
+    DohServer* doh = doh_new("https://dns.google/dns-query", "8.8.8.8", 0, "");
+    EXPECT_TRUE(doh != nullptr);
 
-// Thread-unsafe functions returning pointers to static buffers :-(
-// TODO: switch all res_debug to std::string
-const char* p_type(int type);
-const char* p_section(int section, int opcode);
-const char* p_class(int cl);
-const char* p_rcode(int rcode);
-
-int resolv_set_log_severity(uint32_t logSeverity);
+    // www.example.com
+    uint8_t query[] = "q80BAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB";
+    uint8_t answer[8192];
+    ssize_t len = doh_query(doh, query, sizeof query, answer, sizeof answer);
+    EXPECT_GT(len, 0);
+    doh_delete(doh);
+}

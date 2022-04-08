@@ -59,15 +59,14 @@ constexpr milliseconds kRetryIntervalMs{20};
     {
         std::lock_guard lock(mMutex);
         // keep updating the server to have latest validation status.
-        mValidationRecords.insert_or_assign({event.netId, event.ipAddress, event.protocol},
-                                            event.validation);
+        mValidationRecords.insert_or_assign({event.netId, event.ipAddress}, event.validation);
     }
     mCv.notify_one();
     return ::ndk::ScopedAStatus::ok();
 }
 
 bool UnsolicitedEventListener::waitForPrivateDnsValidation(const std::string& serverAddr,
-                                                           int validation, int protocol) {
+                                                           int validation) {
     const auto now = std::chrono::steady_clock::now();
 
     std::unique_lock lock(mMutex);
@@ -75,7 +74,7 @@ bool UnsolicitedEventListener::waitForPrivateDnsValidation(const std::string& se
 
     // onPrivateDnsValidationEvent() might already be invoked. Search for the record first.
     do {
-        if (findAndRemoveValidationRecord({mNetId, serverAddr, protocol}, validation)) return true;
+        if (findAndRemoveValidationRecord({mNetId, serverAddr}, validation)) return true;
     } while (mCv.wait_until(lock, now + kEventTimeoutMs) != std::cv_status::timeout);
 
     // Timeout.

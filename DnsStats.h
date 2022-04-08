@@ -33,12 +33,12 @@ namespace android::net {
 
 // The overall information of a StatsRecords.
 struct StatsData {
-    StatsData(const netdutils::IPSockAddr& ipSockAddr) : sockAddr(ipSockAddr) {
+    StatsData(const netdutils::IPSockAddr& ipSockAddr) : serverSockAddr(ipSockAddr) {
         lastUpdate = std::chrono::steady_clock::now();
     };
 
-    // Socket address.
-    netdutils::IPSockAddr sockAddr;
+    // Server socket address.
+    netdutils::IPSockAddr serverSockAddr;
 
     // The most recent number of records being accumulated.
     int total = 0;
@@ -106,26 +106,24 @@ class StatsRecords {
     static constexpr int kMaxQuality = 10000;
 };
 
-// DnsStats class manages the statistics of DNS servers or MDNS multicast addresses per netId.
+// DnsStats class manages the statistics of DNS servers per netId.
 // The class itself is not thread-safe.
 class DnsStats {
   public:
-    using StatsMap = std::map<netdutils::IPSockAddr, StatsRecords>;
+    using ServerStatsMap = std::map<netdutils::IPSockAddr, StatsRecords>;
 
-    // Add |addrs| to the map, and remove no-longer-used addresses.
+    // Add |servers| to the map, and remove no-longer-used servers.
     // Return true if they are successfully added; otherwise, return false.
-    bool setAddrs(const std::vector<netdutils::IPSockAddr>& addrs, Protocol protocol);
+    bool setServers(const std::vector<netdutils::IPSockAddr>& servers, Protocol protocol);
 
     // Return true if |record| is successfully added into |server|'s stats; otherwise, return false.
     bool addStats(const netdutils::IPSockAddr& server, const DnsQueryEvent& record);
 
     std::vector<netdutils::IPSockAddr> getSortedServers(Protocol protocol) const;
 
-    // Returns the average query latency in microseconds.
-    std::optional<std::chrono::microseconds> getAverageLatencyUs(Protocol protocol) const;
-
     void dump(netdutils::DumpWriter& dw);
 
+    // For testing.
     std::vector<StatsData> getStats(Protocol protocol) const;
 
     // TODO: Compatible support for getResolverInfo().
@@ -133,7 +131,7 @@ class DnsStats {
     static constexpr size_t kLogSize = 128;
 
   private:
-    std::map<Protocol, StatsMap> mStats;
+    std::map<Protocol, ServerStatsMap> mStats;
 };
 
 }  // namespace android::net

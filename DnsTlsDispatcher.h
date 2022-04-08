@@ -51,7 +51,7 @@ class DnsTlsDispatcher : public PrivateDnsValidationObserver {
     // The order in which servers from |tlsServers| are queried may not be the
     // order passed in by the caller.
     DnsTlsTransport::Response query(const std::list<DnsTlsServer>& tlsServers,
-                                    ResState* _Nonnull statp, const netdutils::Slice query,
+                                    res_state _Nonnull statp, const netdutils::Slice query,
                                     const netdutils::Slice ans, int* _Nonnull resplen);
 
     // Given a |query|, sends it to the server on the network indicated by |mark|,
@@ -64,8 +64,6 @@ class DnsTlsDispatcher : public PrivateDnsValidationObserver {
 
     // Implement PrivateDnsValidationObserver.
     void onValidationStateUpdate(const std::string&, Validation, uint32_t) override{};
-
-    void forceCleanup(unsigned netId) EXCLUDES(sLock);
 
   private:
     DnsTlsDispatcher();
@@ -81,22 +79,15 @@ class DnsTlsDispatcher : public PrivateDnsValidationObserver {
     // Transport is a thin wrapper around DnsTlsTransport, adding reference counting and
     // usage monitoring so we can expire idle sessions from the cache.
     struct Transport {
-        Transport(const DnsTlsServer& server, unsigned mark, unsigned netId,
-                  IDnsTlsSocketFactory* _Nonnull factory, bool revalidationEnabled, int triggerThr,
-                  int unusableThr, int timeout)
+        Transport(const DnsTlsServer& server, unsigned mark, IDnsTlsSocketFactory* _Nonnull factory,
+                  bool revalidationEnabled, int triggerThr, int unusableThr, int timeout)
             : transport(server, mark, factory),
-              mNetId(netId),
               revalidationEnabled(revalidationEnabled),
               triggerThreshold(triggerThr),
               unusableThreshold(unusableThr),
               mTimeout(timeout) {}
-
         // DnsTlsTransport is thread-safe, so it doesn't need to be guarded.
         DnsTlsTransport transport;
-
-        // The expected network, assigned from dns_netid, to which Transport will send DNS packets.
-        const unsigned mNetId;
-
         // This use counter and timestamp are used to ensure that only idle sessions are
         // destroyed.
         int useCount GUARDED_BY(sLock) = 0;
@@ -143,8 +134,7 @@ class DnsTlsDispatcher : public PrivateDnsValidationObserver {
         const std::chrono::milliseconds mTimeout;
     };
 
-    Transport* _Nullable addTransport(const DnsTlsServer& server, unsigned mark, unsigned netId)
-            REQUIRES(sLock);
+    Transport* _Nullable addTransport(const DnsTlsServer& server, unsigned mark) REQUIRES(sLock);
     Transport* _Nullable getTransport(const Key& key) REQUIRES(sLock);
 
     // Cache of reusable DnsTlsTransports.  Transports stay in cache as long as
@@ -161,9 +151,6 @@ class DnsTlsDispatcher : public PrivateDnsValidationObserver {
     // Drop any cache entries whose useCount is zero and which have not been used recently.
     // This function performs a linear scan of mStore.
     void cleanup(std::chrono::time_point<std::chrono::steady_clock> now) REQUIRES(sLock);
-
-    // Force dropping any Transports whose useCount is zero.
-    void forceCleanupLocked(unsigned netId) REQUIRES(sLock);
 
     // Return a sorted list of usable DnsTlsServers in preference order.
     std::list<DnsTlsServer> getOrderedAndUsableServerList(const std::list<DnsTlsServer>& tlsServers,

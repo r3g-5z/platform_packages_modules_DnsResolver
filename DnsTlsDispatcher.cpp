@@ -106,10 +106,10 @@ std::list<DnsTlsServer> DnsTlsDispatcher::getOrderedAndUsableServerList(
 }
 
 DnsTlsTransport::Response DnsTlsDispatcher::query(const std::list<DnsTlsServer>& tlsServers,
-                                                  ResState* statp, const Slice query,
+                                                  res_state statp, const Slice query,
                                                   const Slice ans, int* resplen) {
     const std::list<DnsTlsServer> servers(
-            getOrderedAndUsableServerList(tlsServers, statp->netid, statp->mark));
+            getOrderedAndUsableServerList(tlsServers, statp->netid, statp->_mark));
 
     if (servers.empty()) LOG(WARNING) << "No usable DnsTlsServers";
 
@@ -121,15 +121,14 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const std::list<DnsTlsServer>&
 
         bool connectTriggered = false;
         Stopwatch queryStopwatch;
-        code = this->query(server, statp->netid, statp->mark, query, ans, resplen,
+        code = this->query(server, statp->netid, statp->_mark, query, ans, resplen,
                            &connectTriggered);
 
         dnsQueryEvent->set_latency_micros(saturate_cast<int32_t>(queryStopwatch.timeTakenUs()));
         dnsQueryEvent->set_dns_server_index(serverCount++);
         dnsQueryEvent->set_ip_version(ipFamilyToIPVersion(server.ss.ss_family));
         dnsQueryEvent->set_protocol(PROTO_DOT);
-        std::span<const uint8_t> msg(query.base(), query.size());
-        dnsQueryEvent->set_type(getQueryType(msg));
+        dnsQueryEvent->set_type(getQueryType(query.base(), query.size()));
         dnsQueryEvent->set_connected(connectTriggered);
 
         switch (code) {
@@ -173,7 +172,7 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const DnsTlsServer& server, un
     {
         std::lock_guard guard(sLock);
         if (xport = getTransport(key); xport == nullptr) {
-            xport = addTransport(server, mark, netId);
+            xport = addTransport(server, mark);
         }
         ++xport->useCount;
     }
@@ -227,11 +226,6 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const DnsTlsServer& server, un
     return code;
 }
 
-void DnsTlsDispatcher::forceCleanup(unsigned netId) {
-    std::lock_guard guard(sLock);
-    forceCleanupLocked(netId);
-}
-
 DnsTlsTransport::Result DnsTlsDispatcher::queryInternal(Transport& xport,
                                                         const netdutils::Slice query) {
     LOG(DEBUG) << "Sending query of length " << query.size();
@@ -278,20 +272,8 @@ void DnsTlsDispatcher::cleanup(std::chrono::time_point<std::chrono::steady_clock
     mLastCleanup = now;
 }
 
-// TODO: unify forceCleanupLocked() and cleanup().
-void DnsTlsDispatcher::forceCleanupLocked(unsigned netId) {
-    for (auto it = mStore.begin(); it != mStore.end();) {
-        auto& s = it->second;
-        if (s->useCount == 0 && s->mNetId == netId) {
-            it = mStore.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
 DnsTlsDispatcher::Transport* DnsTlsDispatcher::addTransport(const DnsTlsServer& server,
-                                                            unsigned mark, unsigned netId) {
+                                                            unsigned mark) {
     const Key key = std::make_pair(mark, server);
     Transport* ret = getTransport(key);
     if (ret != nullptr) return ret;
@@ -318,8 +300,8 @@ DnsTlsDispatcher::Transport* DnsTlsDispatcher::addTransport(const DnsTlsServer& 
         queryTimeout = 1000;
     }
 
-    ret = new Transport(server, mark, netId, mFactory.get(), revalidationEnabled, triggerThr,
-                        unusableThr, queryTimeout);
+    ret = new Transport(server, mark, mFactory.get(), revalidationEnabled, triggerThr, unusableThr,
+                        queryTimeout);
     LOG(DEBUG) << "Transport is initialized with { " << triggerThr << ", " << unusableThr << ", "
                << queryTimeout << "ms }"
                << " for server { " << server.toIpString() << "/" << server.name << " }";

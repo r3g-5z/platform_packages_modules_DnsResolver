@@ -33,6 +33,6 @@ parcelable ResolverParamsParcel {
   @utf8InCpp String[] tlsFingerprints = {};
   @utf8InCpp String caCertificate = "";
   int tlsConnectTimeoutMs = 0;
-  @nullable android.net.ResolverOptionsParcel resolverOptions;
+  android.net.ResolverOptionsParcel resolverOptions;
   int[] transportTypes = {};
 }

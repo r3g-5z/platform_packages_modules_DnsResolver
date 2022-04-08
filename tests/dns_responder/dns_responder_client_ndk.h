@@ -21,19 +21,12 @@
 #include <string>
 #include <vector>
 
-#include <android-base/format.h>
-#include <android-base/logging.h>
-
 #include <aidl/android/net/IDnsResolver.h>
 #include <aidl/android/net/INetd.h>
 #include "ResolverStats.h"  // TODO: stop depending on this internal header
 #include "dns_responder.h"
 #include "dns_tls_certificate.h"
 #include "params.h"
-
-using aidl::android::net::NativeNetworkConfig;
-using aidl::android::net::NativeNetworkType;
-using aidl::android::net::NativeVpnType;
 
 inline const std::vector<std::string> kDefaultServers = {"127.0.0.3"};
 inline const std::vector<std::string> kDefaultSearchDomains = {"example.com"};
@@ -92,22 +85,8 @@ class DnsResponderClient {
 
     bool SetResolversFromParcel(const aidl::android::net::ResolverParamsParcel& resolverParams);
 
-    template <class T>
-    static bool isRemoteVersionSupported(T remoteService, int requiredVersion) {
-        int remoteVersion = 0;
-        if (!remoteService->getInterfaceVersion(&remoteVersion).isOk()) {
-            LOG(FATAL) << "Can't get remote version";
-        }
-        if (remoteVersion < requiredVersion) {
-            LOG(WARNING) << fmt::format("Remote version: {} < Required version: {}", remoteVersion,
-                                        requiredVersion);
-            return false;
-        }
-        return true;
-    };
-
-    static NativeNetworkConfig makeNativeNetworkConfig(int netId, NativeNetworkType networkType,
-                                                       int permission, bool secure);
+    static bool isRemoteVersionSupported(aidl::android::net::IDnsResolver* dnsResolverService,
+                                         int enabledVersion);
 
     static bool GetResolverInfo(aidl::android::net::IDnsResolver* dnsResolverService,
                                 unsigned netId, std::vector<std::string>* servers,
