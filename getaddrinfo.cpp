@@ -1437,12 +1437,7 @@ static int dns_getaddrinfo(const char* name, const addrinfo* pai,
 
     ResState res(netcontext, event);
 
-    setMdnsFlag(name, &(res.flags));
-
-    if (isMdnsResolution(res.flags)) {
-        q.qclass |= C_UNICAST;
-        q2.qclass |= C_UNICAST;
-    }
+    setMdnsFlag(name, res.netid, &(res.flags));
 
     int he;
     if (res_searchN(name, &q, &res, &he) < 0) {
