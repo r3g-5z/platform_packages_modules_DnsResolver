@@ -260,7 +260,6 @@ static time_t _time_now(void) {
 #define DNS_TYPE_ALL "\00\0377" /* big-endian decimal 255 */
 
 #define DNS_CLASS_IN "\00\01" /* big-endian decimal 1 */
-#define MDNS_CLASS_UNICAST_IN "\200\01" /* big-endian decimal 32769 */
 
 struct DnsPacket {
     const uint8_t* base;
@@ -375,8 +374,7 @@ static int _dnsPacket_checkQR(DnsPacket* packet) {
         return 0;
     }
     /* CLASS must be IN */
-    if (!_dnsPacket_checkBytes(packet, 2, DNS_CLASS_IN) &&
-        !_dnsPacket_checkBytes(packet, 2, MDNS_CLASS_UNICAST_IN)) {
+    if (!_dnsPacket_checkBytes(packet, 2, DNS_CLASS_IN)) {
         LOG(INFO) << __func__ << ": unsupported CLASS";
         return 0;
     }
@@ -1560,6 +1558,22 @@ android::net::NetworkType resolv_get_network_types_for_net(unsigned netid) {
     NetConfig* netconfig = find_netconfig_locked(netid);
     if (netconfig == nullptr) return android::net::NT_UNKNOWN;
     return convert_network_type(netconfig->transportTypes);
+}
+
+bool is_mdns_supported_transport_types(const std::vector<int32_t>& transportTypes) {
+    for (const auto& tp : transportTypes) {
+        if (tp == IDnsResolver::TRANSPORT_CELLULAR || tp == IDnsResolver::TRANSPORT_VPN) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_mdns_supported_network(unsigned netid) {
+    std::lock_guard guard(cache_mutex);
+    NetConfig* netconfig = find_netconfig_locked(netid);
+    if (netconfig == nullptr) return false;
+    return is_mdns_supported_transport_types(netconfig->transportTypes);
 }
 
 namespace {
