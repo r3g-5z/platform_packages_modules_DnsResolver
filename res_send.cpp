@@ -279,6 +279,10 @@ static int random_bind(int s, int family) {
     for (j = 0; j < 10; j++) {
         /* find a random port between 1025 .. 65534 */
         int port = 1025 + (arc4random_uniform(65535 - 1025));
+        // RFC 6762 section 5.1: Don't use 5353 source port on one-shot Multicast DNS queries. DNS
+        // resolver does not fully compliant mDNS.
+        if (port == 5353) continue;
+
         if (family == AF_INET)
             u.sin.sin_port = htons(port);
         else
@@ -483,17 +487,15 @@ int res_nsend(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* 
         mDnsQueryEvent->set_linux_errno(static_cast<LinuxErrno>(terrno));
         resolv_stats_add(statp->netid, receivedMdnsAddr, mDnsQueryEvent);
 
-        if (resplen <= 0) {
-            _resolv_cache_query_failed(statp->netid, msg, flags);
-            return -terrno;
-        }
-        LOG(DEBUG) << __func__ << ": got answer:";
-        res_pquery(ans.first(resplen));
+        if (resplen > 0) {
+            LOG(DEBUG) << __func__ << ": got answer from mDNS:";
+            res_pquery(ans.first(resplen));
 
-        if (cache_status == RESOLV_CACHE_NOTFOUND) {
-            resolv_cache_add(statp->netid, msg, {ans.data(), resplen});
+            if (cache_status == RESOLV_CACHE_NOTFOUND) {
+                resolv_cache_add(statp->netid, msg, {ans.data(), resplen});
+            }
+            return resplen;
         }
-        return resplen;
     }
 
     if (statp->nameserverCount() == 0) {
@@ -1432,9 +1434,13 @@ int res_tls_send(const std::list<DnsTlsServer>& tlsServers, ResState* statp, con
                  const Slice answer, int* rcode, PrivateDnsMode mode) {
     if (tlsServers.empty()) return -1;
     LOG(INFO) << __func__ << ": performing query over TLS";
+    const bool dotQuickFallback =
+            (mode == PrivateDnsMode::STRICT)
+                    ? 0
+                    : Experiments::getInstance()->getFlag("dot_quick_fallback", 1);
     int resplen = 0;
-    const auto response =
-            DnsTlsDispatcher::getInstance().query(tlsServers, statp, query, answer, &resplen);
+    const auto response = DnsTlsDispatcher::getInstance().query(tlsServers, statp, query, answer,
+                                                                &resplen, dotQuickFallback);
 
     LOG(INFO) << __func__ << ": TLS query result: " << static_cast<int>(response);
     if (mode == PrivateDnsMode::OPPORTUNISTIC) {
