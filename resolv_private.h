@@ -54,6 +54,7 @@
 
 #include <net/if.h>
 #include <time.h>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -87,8 +88,6 @@ union sockaddr_union {
     struct sockaddr_in6 sin6;
 };
 constexpr int MAXPACKET = 8 * 1024;
-
-const unsigned C_UNICAST = 0x8000;  // unicast-response bit for MDNS
 
 struct ResState {
     ResState(const android_net_context* netcontext, android::net::NetworkDnsEventReported* dnsEvent)
@@ -168,14 +167,14 @@ extern const char* const _res_opcodes[];
 int res_nameinquery(const char*, int, int, const uint8_t*, const uint8_t*);
 int res_queriesmatch(const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*);
 
-int res_nquery(ResState*, const char*, int, int, uint8_t*, int, int*);
-int res_nsearch(ResState*, const char*, int, int, uint8_t*, int, int*);
-int res_nquerydomain(ResState*, const char*, const char*, int, int, uint8_t*, int, int*);
-int res_nmkquery(int op, const char* qname, int cl, int type, const uint8_t* data, int datalen,
-                 uint8_t* buf, int buflen, int netcontext_flags);
-int res_nsend(ResState* statp, const uint8_t* buf, int buflen, uint8_t* ans, int anssiz, int* rcode,
+int res_nquery(ResState*, const char*, int, int, std::span<uint8_t>, int*);
+int res_nsearch(ResState*, const char*, int, int, std::span<uint8_t>, int*);
+int res_nquerydomain(ResState*, const char*, const char*, int, int, std::span<uint8_t>, int*);
+int res_nmkquery(int op, const char* qname, int cl, int type, std::span<const uint8_t> data,
+                 std::span<uint8_t> msg, int netcontext_flags);
+int res_nsend(ResState* statp, std::span<const uint8_t> msg, std::span<uint8_t> ans, int* rcode,
               uint32_t flags, std::chrono::milliseconds sleepTimeMs = {});
-int res_nopt(ResState*, int, uint8_t*, int, int);
+int res_nopt(ResState*, int, std::span<uint8_t>, int);
 
 int getaddrinfo_numeric(const char* hostname, const char* servname, addrinfo hints,
                         addrinfo** result);
@@ -184,7 +183,7 @@ int getaddrinfo_numeric(const char* hostname, const char* servname, addrinfo hin
 int herrnoToAiErrno(int herrno);
 
 // Helper function to enable MDNS resolution.
-void setMdnsFlag(std::string_view hostname, uint32_t* flags);
+void setMdnsFlag(std::string_view hostname, unsigned netid, uint32_t* flags);
 
 // Helper function for checking MDNS resolution is enabled or not.
 bool isMdnsResolution(uint32_t flags);
@@ -227,7 +226,7 @@ constexpr T* align_ptr(T* const p) {
 // static_assert(align_ptr<sizeof(uint32_t)>((char*)1004) == (char*)1004);
 // static_assert(align_ptr<sizeof(uint64_t)>((char*)1004) == (char*)1008);
 
-android::net::NsType getQueryType(const uint8_t* msg, size_t msgLen);
+android::net::NsType getQueryType(std::span<const uint8_t> msg);
 
 android::net::IpVersion ipFamilyToIPVersion(int ipFamily);
 

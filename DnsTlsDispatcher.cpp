@@ -107,7 +107,8 @@ std::list<DnsTlsServer> DnsTlsDispatcher::getOrderedAndUsableServerList(
 
 DnsTlsTransport::Response DnsTlsDispatcher::query(const std::list<DnsTlsServer>& tlsServers,
                                                   ResState* statp, const Slice query,
-                                                  const Slice ans, int* resplen) {
+                                                  const Slice ans, int* resplen,
+                                                  bool dotQuickFallback) {
     const std::list<DnsTlsServer> servers(
             getOrderedAndUsableServerList(tlsServers, statp->netid, statp->mark));
 
@@ -128,7 +129,8 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const std::list<DnsTlsServer>&
         dnsQueryEvent->set_dns_server_index(serverCount++);
         dnsQueryEvent->set_ip_version(ipFamilyToIPVersion(server.ss.ss_family));
         dnsQueryEvent->set_protocol(PROTO_DOT);
-        dnsQueryEvent->set_type(getQueryType(query.base(), query.size()));
+        std::span<const uint8_t> msg(query.base(), query.size());
+        dnsQueryEvent->set_type(getQueryType(msg));
         dnsQueryEvent->set_connected(connectTriggered);
 
         switch (code) {
@@ -149,6 +151,9 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const std::list<DnsTlsServer>&
                 // Sync from res_tls_send in res_send.cpp
                 dnsQueryEvent->set_rcode(NS_R_TIMEOUT);
                 resolv_stats_add(statp->netid, IPSockAddr::toIPSockAddr(server.ss), dnsQueryEvent);
+                if (dotQuickFallback) {
+                    return code;
+                }
                 break;
             case DnsTlsTransport::Response::internal_error:
                 dnsQueryEvent->set_rcode(NS_R_INTERNAL_ERROR);
