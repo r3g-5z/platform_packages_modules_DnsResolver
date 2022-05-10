@@ -253,7 +253,7 @@ static struct timespec evNowTime(void) {
 // END: Code copied from ISC eventlib
 
 /* BIONIC-BEGIN: implement source port randomization */
-static int random_bind(int s, int family, bool isMdns) {
+static int random_bind(int s, int family) {
     sockaddr_union u;
     int j;
     socklen_t slen;
@@ -281,7 +281,7 @@ static int random_bind(int s, int family, bool isMdns) {
         int port = 1025 + (arc4random_uniform(65535 - 1025));
         // RFC 6762 section 5.1: Don't use 5353 source port on one-shot Multicast DNS queries. DNS
         // resolver does not fully compliant mDNS.
-        if (isMdns && port == 5353) continue;
+        if (port == 5353) continue;
 
         if (family == AF_INET)
             u.sin.sin_port = htons(port);
@@ -700,7 +700,7 @@ static struct timespec get_timeout(ResState* statp, const res_params* params, co
     if (msec < 1000) {
         msec = 1000;  // Use at least 1000ms
     }
-    LOG(INFO) << __func__ << ": using timeout of " << msec << " msec";
+    LOG(DEBUG) << __func__ << ": using timeout of " << msec << " msec";
 
     struct timespec result;
     result.tv_sec = msec / 1000;
@@ -719,7 +719,7 @@ static int send_vc(ResState* statp, res_params* params, span<const uint8_t> msg,
     int truncating, connreset, n;
     uint8_t* cp;
 
-    LOG(INFO) << __func__ << ": using send_vc";
+    LOG(DEBUG) << __func__ << ": using send_vc";
 
     // It should never happen, but just in case.
     if (ns >= statp->nsaddrs.size()) {
@@ -779,7 +779,7 @@ same_ns:
             }
         }
         errno = 0;
-        if (random_bind(statp->tcp_nssock, nsap->sa_family, false /* isMdns */) < 0) {
+        if (random_bind(statp->tcp_nssock, nsap->sa_family) < 0) {
             *terrno = errno;
             dump_error("bind/vc", nsap);
             statp->closeSockets();
@@ -937,7 +937,7 @@ static int connect_with_timeout(int sock, const sockaddr* nsap, socklen_t salen,
     if (res != 0) {
         timespec now = evNowTime();
         timespec finish = evAddTime(now, timeout);
-        LOG(INFO) << __func__ << ": " << sock << " send_vc";
+        LOG(DEBUG) << __func__ << ": " << sock << " send_vc";
         res = retrying_poll(sock, POLLIN | POLLOUT, &finish);
         if (res <= 0) {
             res = -1;
@@ -953,7 +953,7 @@ static int retrying_poll(const int sock, const short events, const struct timesp
     struct timespec now, timeout;
 
 retry:
-    LOG(INFO) << __func__ << ": " << sock << " retrying_poll";
+    LOG(DEBUG) << __func__ << ": " << sock << " retrying_poll";
 
     now = evNowTime();
     if (evCmpTime(*finish, now) > 0)
@@ -963,7 +963,7 @@ retry:
     struct pollfd fds = {.fd = sock, .events = events};
     int n = ppoll(&fds, 1, &timeout, /*__mask=*/NULL);
     if (n == 0) {
-        LOG(INFO) << __func__ << ": " << sock << " retrying_poll timeout";
+        LOG(DEBUG) << __func__ << ": " << sock << " retrying_poll timeout";
         errno = ETIMEDOUT;
         return 0;
     }
@@ -981,7 +981,7 @@ retry:
             return -1;
         }
     }
-    LOG(INFO) << __func__ << ": " << sock << " retrying_poll returning " << n;
+    LOG(DEBUG) << __func__ << ": " << sock << " retrying_poll returning " << n;
     return n;
 }
 
@@ -1082,9 +1082,7 @@ static int setupUdpSocket(ResState* statp, const sockaddr* sockap, unique_fd* fd
         }
     }
 
-    const auto addr = IPSockAddr::toIPSockAddr(*sockap);
-    const bool isMdns = (addr == mdns_addrs[0] || addr == mdns_addrs[1]);
-    if (random_bind(*fd_out, sockap->sa_family, isMdns) < 0) {
+    if (random_bind(*fd_out, sockap->sa_family) < 0) {
         *terrno = errno;
         dump_error("bind", sockap);
         return 0;
@@ -1398,7 +1396,7 @@ static int res_private_dns_send(ResState* statp, const Slice query, const Slice 
 ssize_t res_doh_send(ResState* statp, const Slice query, const Slice answer, int* rcode) {
     auto& privateDnsConfiguration = PrivateDnsConfiguration::getInstance();
     const unsigned netId = statp->netid;
-    LOG(INFO) << __func__ << ": performing query over Https";
+    LOG(DEBUG) << __func__ << ": performing query over Https";
     Stopwatch queryStopwatch;
     int queryTimeout = Experiments::getInstance()->getFlag(
             "doh_query_timeout_ms", PrivateDnsConfiguration::kDohQueryDefaultTimeoutMs);
@@ -1435,10 +1433,14 @@ ssize_t res_doh_send(ResState* statp, const Slice query, const Slice answer, int
 int res_tls_send(const std::list<DnsTlsServer>& tlsServers, ResState* statp, const Slice query,
                  const Slice answer, int* rcode, PrivateDnsMode mode) {
     if (tlsServers.empty()) return -1;
-    LOG(INFO) << __func__ << ": performing query over TLS";
+    LOG(DEBUG) << __func__ << ": performing query over TLS";
+    const bool dotQuickFallback =
+            (mode == PrivateDnsMode::STRICT)
+                    ? 0
+                    : Experiments::getInstance()->getFlag("dot_quick_fallback", 1);
     int resplen = 0;
-    const auto response =
-            DnsTlsDispatcher::getInstance().query(tlsServers, statp, query, answer, &resplen);
+    const auto response = DnsTlsDispatcher::getInstance().query(tlsServers, statp, query, answer,
+                                                                &resplen, dotQuickFallback);
 
     LOG(INFO) << __func__ << ": TLS query result: " << static_cast<int>(response);
     if (mode == PrivateDnsMode::OPPORTUNISTIC) {
