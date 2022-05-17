@@ -76,7 +76,7 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
-    const DOH_THREADS: usize = 2;
+    const DOH_THREADS: usize = 1;
 
     pub fn new(validation: ValidationReporter, tagger: SocketTagger) -> Result<Dispatcher> {
         let (cmd_sender, cmd_receiver) = mpsc::channel::<Command>(MAX_BUFFERED_CMD_COUNT);
@@ -87,10 +87,7 @@ impl Dispatcher {
             .build()?;
         let join_handle = runtime.spawn(async {
             let result = Driver::new(cmd_receiver, validation, tagger).drive().await;
-            match result {
-                Err(ref e) => error!("Dispatcher driver exited due to {:?}", e),
-                Ok(()) => (),
-            }
+            if let Err(ref e) = result { error!("Dispatcher driver exited due to {:?}", e) }
             result
         });
         Ok(Dispatcher { cmd_sender, join_handle, runtime })

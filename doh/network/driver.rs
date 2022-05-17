@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::connection::Connection;
 use crate::dispatcher::{QueryError, Response};
 use crate::encoding;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio::task;
@@ -76,6 +76,7 @@ async fn build_connection(
     info: &ServerInfo,
     tag_socket: &SocketTagger,
     config: &mut Config,
+    session: Option<Vec<u8>>,
 ) -> Result<Connection> {
     use std::ops::DerefMut;
     Ok(Connection::new(
@@ -85,12 +86,13 @@ async fn build_connection(
         info.net_id,
         tag_socket,
         config.take().await.deref_mut(),
+        session,
     )
     .await?)
 }
 
 impl Driver {
-    const MAX_BUFFERED_COMMANDS: usize = 10;
+    const MAX_BUFFERED_COMMANDS: usize = 50;
 
     pub async fn new(
         info: ServerInfo,
@@ -100,7 +102,7 @@ impl Driver {
     ) -> Result<(Self, mpsc::Sender<Command>, watch::Receiver<Status>)> {
         let (command_tx, command_rx) = mpsc::channel(Self::MAX_BUFFERED_COMMANDS);
         let (status_tx, status_rx) = watch::channel(Status::Unprobed);
-        let connection = build_connection(&info, &tag_socket, &mut config).await?;
+        let connection = build_connection(&info, &tag_socket, &mut config, None).await?;
         Ok((
             Self { info, config, connection, status_tx, command_rx, validation, tag_socket },
             command_tx,
@@ -111,14 +113,10 @@ impl Driver {
     pub async fn drive(mut self) -> Result<()> {
         while let Some(cmd) = self.command_rx.recv().await {
             match cmd {
-                Command::Probe(duration) => match self.probe(duration).await {
-                    Err(e) => self.status_tx.send(Status::Failed(Arc::new(e)))?,
-                    Ok(()) => (),
-                },
-                Command::Query(query) => match self.send_query(query).await {
-                    Err(e) => debug!("Unable to send query: {:?}", e),
-                    Ok(()) => (),
-                },
+                Command::Probe(duration) =>
+                    if let Err(e) = self.probe(duration).await { self.status_tx.send(Status::Failed(Arc::new(e)))? },
+                Command::Query(query) =>
+                    if let Err(e) = self.send_query(query).await { debug!("Unable to send query: {:?}", e) },
             };
         }
         Ok(())
@@ -130,7 +128,7 @@ impl Driver {
             // If our network is currently failed, it may be due to issues with the connection.
             // Re-establish before re-probing
             self.connection =
-                build_connection(&self.info, &self.tag_socket, &mut self.config).await?;
+                build_connection(&self.info, &self.tag_socket, &mut self.config, None).await?;
             self.status_tx.send(Status::Unprobed)?;
         }
         if self.status_tx.borrow().is_live() {
@@ -175,10 +173,19 @@ impl Driver {
     }
 
     async fn send_query(&mut self, query: Query) -> Result<()> {
+        // If the associated receiver has been closed, meaning that the request has already
+        // timed out, just drop it. This check helps drain the channel quickly in the case
+        // where the network is stalled.
+        if query.response.is_closed() {
+            bail!("Abandoning expired DNS request")
+        }
+
         if !self.connection.wait_for_live().await {
+            let session =
+                if self.info.use_session_resumption { self.connection.session() } else { None };
             // Try reconnecting
             self.connection =
-                build_connection(&self.info, &self.tag_socket, &mut self.config).await?;
+                build_connection(&self.info, &self.tag_socket, &mut self.config, session).await?;
         }
         let request = encoding::dns_request(&query.query, &self.info.url)?;
         let stream_fut = self.connection.query(request, Some(query.expiry)).await?;

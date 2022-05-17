@@ -47,6 +47,8 @@ pub struct ServerInfo {
     pub domain: Option<String>,
     pub sk_mark: u32,
     pub cert_path: Option<String>,
+    pub idle_timeout_ms: u64,
+    pub use_session_resumption: bool,
 }
 
 #[derive(Debug)]
@@ -101,7 +103,7 @@ impl Network {
                 .unwrap_or_else(|_| {
                     warn!("Query result listener went away before receiving a response")
                 }),
-            Status::Live => self.command_tx.send(Command::Query(query)).await?,
+            Status::Live => self.command_tx.try_send(Command::Query(query))?,
         }
         Ok(())
     }
