@@ -94,6 +94,9 @@ const std::string kDotValidationLatencyFactorFlag(
 const std::string kDotValidationLatencyOffsetMsFlag(
         "persist.device_config.netd_native.dot_validation_latency_offset_ms");
 const std::string kDotQuickFallbackFlag("persist.device_config.netd_native.dot_quick_fallback");
+const std::string kDotKeepUnusableXportSecFlag(
+        "persist.device_config.netd_native.dot_keep_unusable_xport_sec");
+
 // Semi-public Bionic hook used by the NDK (frameworks/base/native/android/net.c)
 // Tested here for convenience.
 extern "C" int android_getaddrinfofornet(const char* hostname, const char* servname,
@@ -778,6 +781,25 @@ TEST_F(ResolverTest, GetAddrInfo_localhost) {
     // Expect no DNS queries; ip6-localhost is resolved via /etc/hosts
     EXPECT_TRUE(dns.queries().empty()) << dns.dumpQueries();
     EXPECT_EQ(kIp6LocalHostAddr, ToString(result));
+}
+
+TEST_F(ResolverTest, GetAddrInfo_NumericHostname) {
+    // Add a no-op nameserver which shouldn't receive any queries
+    test::DNSResponder dns;
+    StartDns(dns, {});
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+
+    ScopedAddrinfo result = safe_getaddrinfo("1.2.3.4", nullptr, nullptr);
+    EXPECT_TRUE(result != nullptr);
+    // Expect no DNS queries. Numeric hostname doesn't need to resolve.
+    EXPECT_TRUE(dns.queries().empty()) << dns.dumpQueries();
+    EXPECT_EQ("1.2.3.4", ToString(result));
+
+    result = safe_getaddrinfo("2001:db8::1", nullptr, nullptr);
+    EXPECT_TRUE(result != nullptr);
+    // Expect no DNS queries. Numeric hostname doesn't need to resolve.
+    EXPECT_TRUE(dns.queries().empty()) << dns.dumpQueries();
+    EXPECT_EQ("2001:db8::1", ToString(result));
 }
 
 TEST_F(ResolverTest, GetAddrInfo_InvalidSocketType) {
@@ -4888,6 +4910,87 @@ TEST_F(ResolverTest, SkipUnusableTlsServer) {
         EXPECT_EQ(dot1.acceptConnectionsCount(), config.expectedQueriesSentToDot1);
         EXPECT_EQ(dot2.acceptConnectionsCount(), config.expectedQueriesSentToDot2);
     }
+}
+
+// Tests that, even if all DoT servers are mark as unusable, DnsResolver will try to send DNS
+// queries to DoT servers after their expiration.
+TEST_F(ResolverTest, UnusableTlsServersWorkAgain) {
+    const auto sendQueryAndCheckResult = [&]() {
+        int fd = resNetworkQuery(TEST_NETID, kHelloExampleCom, ns_c_in, ns_t_aaaa,
+                                 ANDROID_RESOLV_NO_CACHE_LOOKUP);
+        expectAnswersValid(fd, AF_INET6, kHelloExampleComAddrV6);
+    };
+
+    constexpr int DOT_CONNECT_TIMEOUT_MS = 1000;
+    constexpr int DOT_XPORT_UNUSABLE_THRESHOLD = 1;
+    constexpr int DOT_KEEP_UNUSABLE_XPORT_SEC = 2;
+
+    const std::string addr1 = getUniqueIPv4Address();
+    const std::string addr2 = getUniqueIPv4Address();
+    test::DNSResponder dns1(addr1);
+    test::DNSResponder dns2(addr2);
+    test::DnsTlsFrontend dot1(addr1, "853", addr1, "53");
+    test::DnsTlsFrontend dot2(addr2, "853", addr2, "53");
+    dns1.addMapping(kHelloExampleCom, ns_type::ns_t_aaaa, kHelloExampleComAddrV6);
+    dns2.addMapping(kHelloExampleCom, ns_type::ns_t_aaaa, kHelloExampleComAddrV6);
+    ASSERT_TRUE(dns1.startServer());
+    ASSERT_TRUE(dns2.startServer());
+    ASSERT_TRUE(dot1.startServer());
+    ASSERT_TRUE(dot2.startServer());
+
+    ScopedSystemProperties sp1(kDotConnectTimeoutMsFlag, std::to_string(DOT_CONNECT_TIMEOUT_MS));
+    ScopedSystemProperties sp2(kDotXportUnusableThresholdFlag,
+                               std::to_string(DOT_XPORT_UNUSABLE_THRESHOLD));
+    ScopedSystemProperties sp3(kDotQuickFallbackFlag, "1");
+    ScopedSystemProperties sp4(kDotRevalidationThresholdFlag, "-1");
+    ScopedSystemProperties sp5(kDotKeepUnusableXportSecFlag,
+                               std::to_string(DOT_KEEP_UNUSABLE_XPORT_SEC));
+    resetNetwork();
+
+    // Private DNS opportunistic mode.
+    auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+    parcel.servers = {addr1, addr2};
+    parcel.tlsServers = {addr1, addr2};
+    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+    EXPECT_TRUE(WaitForPrivateDnsValidation(dot1.listen_address(), true));
+    EXPECT_TRUE(WaitForPrivateDnsValidation(dot2.listen_address(), true));
+    EXPECT_TRUE(dot1.waitForQueries(1));
+    EXPECT_TRUE(dot2.waitForQueries(1));
+    dot1.clearQueries();
+    dot2.clearQueries();
+    dot1.clearConnectionsCount();
+    dot2.clearConnectionsCount();
+
+    // Set the DoT servers as unresponsive to connection handshake.
+    dot1.setHangOnHandshakeForTesting(true);
+    dot2.setHangOnHandshakeForTesting(true);
+
+    // Send two queries in series. The two DoT servers will be marked as unusable.
+    sendQueryAndCheckResult();
+    sendQueryAndCheckResult();
+    EXPECT_EQ(dot1.acceptConnectionsCount(), 1);
+    EXPECT_EQ(dot2.acceptConnectionsCount(), 1);
+    EXPECT_EQ(dot1.queries(), 0);
+    EXPECT_EQ(dot2.queries(), 0);
+
+    // Wait for a bit more than `dot_keep_unusable_xport_sec` seconds, and then send one
+    // DNS query. DnsResolver should remove the unusable mark from the two DoT servers.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    sendQueryAndCheckResult();
+    EXPECT_EQ(dot1.acceptConnectionsCount(), 1);
+    EXPECT_EQ(dot2.acceptConnectionsCount(), 1);
+    EXPECT_EQ(dot1.queries(), 0);
+    EXPECT_EQ(dot2.queries(), 0);
+
+    // Recover the DoT servers, and then send one DNS query. Expect that DnsResolver uses DoT again.
+    dot1.setHangOnHandshakeForTesting(false);
+    dot2.setHangOnHandshakeForTesting(false);
+    sendQueryAndCheckResult();
+    EXPECT_EQ(dot1.acceptConnectionsCount(), 2);
+    EXPECT_EQ(dot2.acceptConnectionsCount(), 1);
+    EXPECT_EQ(dot1.queries(), 1);
+    EXPECT_EQ(dot2.queries(), 0);
 }
 
 // Verifies that the DnsResolver re-validates the DoT server when several DNS queries to
