@@ -26,6 +26,7 @@
 #include "resolv_cache.h"
 #include "resolv_private.h"
 #include "stats.pb.h"
+#include "util.h"
 
 #include <android-base/logging.h>
 
@@ -114,9 +115,9 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const std::list<DnsTlsServer>&
     if (servers.empty()) {
         LOG(WARNING) << "No usable DnsTlsServers";
 
-        // Call cleanup so the expired Transports can be removed as expected.
+        // Call maybeCleanup so the expired Transports can be removed as expected.
         std::lock_guard guard(sLock);
-        cleanup(std::chrono::steady_clock::now());
+        maybeCleanup(std::chrono::steady_clock::now());
     }
 
     DnsTlsTransport::Response code = DnsTlsTransport::Response::internal_error;
@@ -236,14 +237,14 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const DnsTlsServer& server, un
                          << (result.ok() ? "succeeded" : "failed: " + result.error().message());
         }
 
-        cleanup(now);
+        maybeCleanup(now);
     }
     return code;
 }
 
 void DnsTlsDispatcher::forceCleanup(unsigned netId) {
     std::lock_guard guard(sLock);
-    forceCleanupLocked(netId);
+    cleanup(std::chrono::steady_clock::now(), std::chrono::seconds(-1), netId);
 }
 
 DnsTlsTransport::Result DnsTlsDispatcher::queryInternal(Transport& xport,
@@ -275,33 +276,45 @@ DnsTlsTransport::Result DnsTlsDispatcher::queryInternal(Transport& xport,
 
 // This timeout effectively controls how long to keep SSL session tickets.
 static constexpr std::chrono::minutes IDLE_TIMEOUT(5);
-void DnsTlsDispatcher::cleanup(std::chrono::time_point<std::chrono::steady_clock> now) {
+void DnsTlsDispatcher::maybeCleanup(std::chrono::time_point<std::chrono::steady_clock> now) {
+    // Make the timeout tunable via experiment flag for testing.
+    std::chrono::seconds unusable_xport_idle_timeout{-1};
+    const int value = Experiments::getInstance()->getFlag("dot_keep_unusable_xport_sec", -1);
+    if (value > -1 && isUserDebugBuild() && std::chrono::seconds(value) < IDLE_TIMEOUT) {
+        unusable_xport_idle_timeout = std::chrono::seconds(value);
+    }
+
     // To avoid scanning mStore after every query, return early if a cleanup has been
     // performed recently.
-    if (now - mLastCleanup < IDLE_TIMEOUT) {
+    const std::chrono::seconds timeout = (unusable_xport_idle_timeout < IDLE_TIMEOUT)
+                                                 ? unusable_xport_idle_timeout
+                                                 : IDLE_TIMEOUT;
+    if (now - mLastCleanup < timeout) {
         return;
     }
-    for (auto it = mStore.begin(); it != mStore.end();) {
-        auto& s = it->second;
-        if (s->useCount == 0 && now - s->lastUsed > IDLE_TIMEOUT) {
-            it = mStore.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    cleanup(now, unusable_xport_idle_timeout, std::nullopt);
     mLastCleanup = now;
 }
 
-// TODO: unify forceCleanupLocked() and cleanup().
-void DnsTlsDispatcher::forceCleanupLocked(unsigned netId) {
-    for (auto it = mStore.begin(); it != mStore.end();) {
-        auto& s = it->second;
-        if (s->useCount == 0 && s->mNetId == netId) {
-            it = mStore.erase(it);
-        } else {
-            ++it;
+void DnsTlsDispatcher::cleanup(std::chrono::time_point<std::chrono::steady_clock> now,
+                               std::chrono::seconds unusable_xport_idle_timeout,
+                               std::optional<unsigned> netId) {
+    std::erase_if(mStore, [&](const auto& item) REQUIRES(sLock) {
+        auto const& [_, xport] = item;
+        if (xport->useCount == 0) {
+            // Remove the Transports of the associated network.
+            if (netId.has_value() && xport->mNetId == netId.value()) return true;
+
+            // Remove all expired Transports.
+            if (now - xport->lastUsed > IDLE_TIMEOUT) return true;
+
+            // Unusable Transports should be removed earlier.
+            if (!xport->usable() && unusable_xport_idle_timeout.count() >= 0 &&
+                now - xport->lastUsed > unusable_xport_idle_timeout)
+                return true;
         }
-    }
+        return false;
+    });
 }
 
 DnsTlsDispatcher::Transport* DnsTlsDispatcher::addTransport(const DnsTlsServer& server,
