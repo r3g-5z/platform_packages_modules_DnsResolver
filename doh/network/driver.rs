@@ -22,12 +22,13 @@ use crate::connection::Connection;
 use crate::dispatcher::{QueryError, Response};
 use crate::encoding;
 use anyhow::{anyhow, bail, Result};
-use log::{debug, info};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio::task;
 
 use super::{Query, ServerInfo, SocketTagger, ValidationReporter};
+
+use log::debug;
 
 pub struct Driver {
     info: ServerInfo,
@@ -112,16 +113,10 @@ impl Driver {
     pub async fn drive(mut self) -> Result<()> {
         while let Some(cmd) = self.command_rx.recv().await {
             match cmd {
-                Command::Probe(duration) => {
-                    if let Err(e) = self.probe(duration).await {
-                        self.status_tx.send(Status::Failed(Arc::new(e)))?
-                    }
-                }
-                Command::Query(query) => {
-                    if let Err(e) = self.send_query(query).await {
-                        info!("Unable to send query: {:?}", e)
-                    }
-                }
+                Command::Probe(duration) =>
+                    if let Err(e) = self.probe(duration).await { self.status_tx.send(Status::Failed(Arc::new(e)))? },
+                Command::Query(query) =>
+                    if let Err(e) = self.send_query(query).await { debug!("Unable to send query: {:?}", e) },
             };
         }
         Ok(())
@@ -145,7 +140,7 @@ impl Driver {
     }
 
     async fn force_probe(&mut self, probe_timeout: Duration) -> Result<()> {
-        info!("Sending probe to server {} on Network {}", self.info.peer_addr, self.info.net_id);
+        debug!("Sending probe to server {} on Network {}", self.info.peer_addr, self.info.net_id);
         let probe = encoding::probe_query()?;
         let dns_request = encoding::dns_request(&probe, &self.info.url)?;
         let expiry = BootTime::now().checked_add(probe_timeout);
@@ -198,7 +193,7 @@ impl Driver {
             let stream = match stream_fut.await {
                 Some(stream) => stream,
                 None => {
-                    info!("Connection died while processing request");
+                    debug!("Connection died while processing request");
                     // We don't care if the response is gone
                     let _ =
                         query.response.send(Response::Error { error: QueryError::ConnectionError });

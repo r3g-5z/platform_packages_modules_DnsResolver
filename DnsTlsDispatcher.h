@@ -83,10 +83,11 @@ class DnsTlsDispatcher : public PrivateDnsValidationObserver {
     // usage monitoring so we can expire idle sessions from the cache.
     struct Transport {
         Transport(const DnsTlsServer& server, unsigned mark, unsigned netId,
-                  IDnsTlsSocketFactory* _Nonnull factory, int triggerThr, int unusableThr,
-                  int timeout)
+                  IDnsTlsSocketFactory* _Nonnull factory, bool revalidationEnabled, int triggerThr,
+                  int unusableThr, int timeout)
             : transport(server, mark, factory),
               mNetId(netId),
+              revalidationEnabled(revalidationEnabled),
               triggerThreshold(triggerThr),
               unusableThreshold(unusableThr),
               mTimeout(timeout) {}
@@ -105,12 +106,9 @@ class DnsTlsDispatcher : public PrivateDnsValidationObserver {
 
         // If DoT revalidation is disabled, it returns true; otherwise, it returns
         // whether or not this Transport is usable.
-        bool usable() REQUIRES(sLock);
+        bool usable() const REQUIRES(sLock);
 
-        // Used to track if this Transport is usable.
-        int continuousfailureCount GUARDED_BY(sLock) = 0;
-
-        bool checkRevalidationNecessary() REQUIRES(sLock);
+        bool checkRevalidationNecessary(DnsTlsTransport::Response code) REQUIRES(sLock);
 
         std::chrono::milliseconds timeout() const { return mTimeout; }
 
@@ -119,24 +117,25 @@ class DnsTlsDispatcher : public PrivateDnsValidationObserver {
         static constexpr int kDotQueryTimeoutMs = -1;
 
       private:
-        // The flag to record whether or not dot_revalidation_threshold is ever reached.
-        bool isRevalidationThresholdReached GUARDED_BY(sLock) = false;
+        // Used to track if this Transport is usable.
+        int continuousfailureCount GUARDED_BY(sLock) = 0;
 
-        // The flag to record whether or not dot_xport_unusable_threshold is ever reached.
-        bool isXportUnusableThresholdReached GUARDED_BY(sLock) = false;
+        // Used to indicate whether DoT revalidation is enabled for this Transport.
+        // The value is set to true only if:
+        //    1. both triggerThreshold and unusableThreshold are  positive values.
+        //    2. private DNS mode is opportunistic.
+        const bool revalidationEnabled;
 
-        // If the number of continuous query timeouts reaches the threshold, mark the
-        // server as unvalidated and trigger a validation.
-        // If the value is not a positive value or private DNS mode is strict mode, no threshold is
-        // set. Note that it must be at least 10, or it breaks
-        // ConnectTlsServerTimeout_ConcurrentQueries test.
+        // The number of continuous failures to trigger a validation. It takes effect when DoT
+        // revalidation is on. If the value is not a positive value, DoT revalidation is disabled.
+        // Note that it must be at least 10, or it breaks ConnectTlsServerTimeout_ConcurrentQueries
+        // test.
         const int triggerThreshold;
 
         // The threshold to determine if this Transport is considered unusable.
-        // If the number of continuous query timeouts reaches the threshold, mark this
-        // Transport as unusable. An unusable Transport won't be used anymore.
-        // If the value is not a positive value or private DNS mode is strict mode, no threshold is
-        // set.
+        // If continuousfailureCount reaches this value, this Transport is no longer used. It
+        // takes effect when DoT revalidation is on. If the value is not a positive value, DoT
+        // revalidation is disabled.
         const int unusableThreshold;
 
         // The time to await a future (the result of a DNS request) from the DnsTlsTransport
@@ -160,13 +159,12 @@ class DnsTlsDispatcher : public PrivateDnsValidationObserver {
     DnsTlsTransport::Result queryInternal(Transport& transport, const netdutils::Slice query)
             EXCLUDES(sLock);
 
-    void maybeCleanup(std::chrono::time_point<std::chrono::steady_clock> now) REQUIRES(sLock);
-
     // Drop any cache entries whose useCount is zero and which have not been used recently.
     // This function performs a linear scan of mStore.
-    void cleanup(std::chrono::time_point<std::chrono::steady_clock> now,
-                 std::chrono::seconds unusable_xport_idle_timeout, std::optional<unsigned> netId)
-            REQUIRES(sLock);
+    void cleanup(std::chrono::time_point<std::chrono::steady_clock> now) REQUIRES(sLock);
+
+    // Force dropping any Transports whose useCount is zero.
+    void forceCleanupLocked(unsigned netId) REQUIRES(sLock);
 
     // Return a sorted list of usable DnsTlsServers in preference order.
     std::list<DnsTlsServer> getOrderedAndUsableServerList(const std::list<DnsTlsServer>& tlsServers,

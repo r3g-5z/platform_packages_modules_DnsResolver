@@ -145,9 +145,6 @@ void PrivateDnsConfiguration::clear(unsigned netId) {
     std::lock_guard guard(mPrivateDnsLock);
     mPrivateDnsModes.erase(netId);
     mPrivateDnsTransports.erase(netId);
-
-    // Notify the relevant private DNS validations, if they are waiting, to finish.
-    mCv.notify_all();
 }
 
 base::Result<void> PrivateDnsConfiguration::requestValidation(unsigned netId,
@@ -227,17 +224,14 @@ void PrivateDnsConfiguration::startValidation(const ServerIdentity& identity, un
             const bool needs_reeval =
                     this->recordPrivateDnsValidation(identity, netId, success, isRevalidation);
 
-            if (!needs_reeval || !backoff.hasNextTimeout()) {
+            if (!needs_reeval) {
                 break;
             }
 
-            std::unique_lock<std::mutex> cvGuard(mPrivateDnsLock);
-            // If the timeout expired and the predicate still evaluates to false, wait_for returns
-            // false.
-            if (mCv.wait_for(cvGuard, backoff.getNextTimeout(),
-                             [this, netId]() REQUIRES(mPrivateDnsLock) {
-                                 return mPrivateDnsModes.find(netId) == mPrivateDnsModes.end();
-                             })) {
+            if (backoff.hasNextTimeout()) {
+                // TODO: make the thread able to receive signals to shutdown early.
+                std::this_thread::sleep_for(backoff.getNextTimeout());
+            } else {
                 break;
             }
         }

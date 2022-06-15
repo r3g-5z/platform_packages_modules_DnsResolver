@@ -26,7 +26,6 @@
 #include "resolv_cache.h"
 #include "resolv_private.h"
 #include "stats.pb.h"
-#include "util.h"
 
 #include <android-base/logging.h>
 
@@ -68,7 +67,8 @@ std::list<DnsTlsServer> DnsTlsDispatcher::getOrderedAndUsableServerList(
 
         for (const auto& tlsServer : tlsServers) {
             const Key key = std::make_pair(mark, tlsServer);
-            if (Transport* xport = getTransport(key); xport != nullptr) {
+            if (const Transport* xport = getTransport(key); xport != nullptr) {
+                // DoT revalidation specific feature.
                 if (!xport->usable()) {
                     // Don't use this xport. It will be removed after timeout
                     // (IDLE_TIMEOUT minutes).
@@ -112,13 +112,7 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const std::list<DnsTlsServer>&
     const std::list<DnsTlsServer> servers(
             getOrderedAndUsableServerList(tlsServers, statp->netid, statp->mark));
 
-    if (servers.empty()) {
-        LOG(WARNING) << "No usable DnsTlsServers";
-
-        // Call maybeCleanup so the expired Transports can be removed as expected.
-        std::lock_guard guard(sLock);
-        maybeCleanup(std::chrono::steady_clock::now());
-    }
+    if (servers.empty()) LOG(WARNING) << "No usable DnsTlsServers";
 
     DnsTlsTransport::Response code = DnsTlsTransport::Response::internal_error;
     int serverCount = 0;
@@ -215,14 +209,9 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const DnsTlsServer& server, un
         std::lock_guard guard(sLock);
         --xport->useCount;
         xport->lastUsed = now;
-        if (code == DnsTlsTransport::Response::network_error) {
-            xport->continuousfailureCount++;
-        } else {
-            xport->continuousfailureCount = 0;
-        }
 
         // DoT revalidation specific feature.
-        if (xport->checkRevalidationNecessary()) {
+        if (xport->checkRevalidationNecessary(code)) {
             // Even if the revalidation passes, it doesn't guarantee that DoT queries
             // to the xport can stop failing because revalidation creates a new connection
             // to probe while the xport still uses an existing connection. So far, there isn't
@@ -237,14 +226,14 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const DnsTlsServer& server, un
                          << (result.ok() ? "succeeded" : "failed: " + result.error().message());
         }
 
-        maybeCleanup(now);
+        cleanup(now);
     }
     return code;
 }
 
 void DnsTlsDispatcher::forceCleanup(unsigned netId) {
     std::lock_guard guard(sLock);
-    cleanup(std::chrono::steady_clock::now(), std::chrono::seconds(-1), netId);
+    forceCleanupLocked(netId);
 }
 
 DnsTlsTransport::Result DnsTlsDispatcher::queryInternal(Transport& xport,
@@ -276,45 +265,33 @@ DnsTlsTransport::Result DnsTlsDispatcher::queryInternal(Transport& xport,
 
 // This timeout effectively controls how long to keep SSL session tickets.
 static constexpr std::chrono::minutes IDLE_TIMEOUT(5);
-void DnsTlsDispatcher::maybeCleanup(std::chrono::time_point<std::chrono::steady_clock> now) {
-    // Make the timeout tunable via experiment flag for testing.
-    std::chrono::seconds unusable_xport_idle_timeout{-1};
-    const int value = Experiments::getInstance()->getFlag("dot_keep_unusable_xport_sec", -1);
-    if (value > -1 && isUserDebugBuild() && std::chrono::seconds(value) < IDLE_TIMEOUT) {
-        unusable_xport_idle_timeout = std::chrono::seconds(value);
-    }
-
+void DnsTlsDispatcher::cleanup(std::chrono::time_point<std::chrono::steady_clock> now) {
     // To avoid scanning mStore after every query, return early if a cleanup has been
     // performed recently.
-    const std::chrono::seconds timeout = (unusable_xport_idle_timeout < IDLE_TIMEOUT)
-                                                 ? unusable_xport_idle_timeout
-                                                 : IDLE_TIMEOUT;
-    if (now - mLastCleanup < timeout) {
+    if (now - mLastCleanup < IDLE_TIMEOUT) {
         return;
     }
-    cleanup(now, unusable_xport_idle_timeout, std::nullopt);
+    for (auto it = mStore.begin(); it != mStore.end();) {
+        auto& s = it->second;
+        if (s->useCount == 0 && now - s->lastUsed > IDLE_TIMEOUT) {
+            it = mStore.erase(it);
+        } else {
+            ++it;
+        }
+    }
     mLastCleanup = now;
 }
 
-void DnsTlsDispatcher::cleanup(std::chrono::time_point<std::chrono::steady_clock> now,
-                               std::chrono::seconds unusable_xport_idle_timeout,
-                               std::optional<unsigned> netId) {
-    std::erase_if(mStore, [&](const auto& item) REQUIRES(sLock) {
-        auto const& [_, xport] = item;
-        if (xport->useCount == 0) {
-            // Remove the Transports of the associated network.
-            if (netId.has_value() && xport->mNetId == netId.value()) return true;
-
-            // Remove all expired Transports.
-            if (now - xport->lastUsed > IDLE_TIMEOUT) return true;
-
-            // Unusable Transports should be removed earlier.
-            if (!xport->usable() && unusable_xport_idle_timeout.count() >= 0 &&
-                now - xport->lastUsed > unusable_xport_idle_timeout)
-                return true;
+// TODO: unify forceCleanupLocked() and cleanup().
+void DnsTlsDispatcher::forceCleanupLocked(unsigned netId) {
+    for (auto it = mStore.begin(); it != mStore.end();) {
+        auto& s = it->second;
+        if (s->useCount == 0 && s->mNetId == netId) {
+            it = mStore.erase(it);
+        } else {
+            ++it;
         }
-        return false;
-    });
+    }
 }
 
 DnsTlsDispatcher::Transport* DnsTlsDispatcher::addTransport(const DnsTlsServer& server,
@@ -331,11 +308,12 @@ DnsTlsDispatcher::Transport* DnsTlsDispatcher::addTransport(const DnsTlsServer& 
     int queryTimeout = instance->getFlag("dot_query_timeout_ms", Transport::kDotQueryTimeoutMs);
 
     // Check and adjust the parameters if they are improperly set.
+    bool revalidationEnabled = false;
     const bool isForOpportunisticMode = server.name.empty();
-    if (triggerThr <= 0 || !isForOpportunisticMode) {
+    if (triggerThr > 0 && unusableThr > 0 && isForOpportunisticMode) {
+        revalidationEnabled = true;
+    } else {
         triggerThr = -1;
-    }
-    if (unusableThr <= 0 || !isForOpportunisticMode) {
         unusableThr = -1;
     }
     if (queryTimeout < 0) {
@@ -344,10 +322,11 @@ DnsTlsDispatcher::Transport* DnsTlsDispatcher::addTransport(const DnsTlsServer& 
         queryTimeout = 1000;
     }
 
-    ret = new Transport(server, mark, netId, mFactory.get(), triggerThr, unusableThr, queryTimeout);
-    LOG(INFO) << "Transport is initialized with { " << triggerThr << ", " << unusableThr << ", "
-              << queryTimeout << "ms }"
-              << " for server { " << server.toIpString() << "/" << server.name << " }";
+    ret = new Transport(server, mark, netId, mFactory.get(), revalidationEnabled, triggerThr,
+                        unusableThr, queryTimeout);
+    LOG(DEBUG) << "Transport is initialized with { " << triggerThr << ", " << unusableThr << ", "
+               << queryTimeout << "ms }"
+               << " for server { " << server.toIpString() << "/" << server.name << " }";
 
     mStore[key].reset(ret);
 
@@ -359,23 +338,26 @@ DnsTlsDispatcher::Transport* DnsTlsDispatcher::getTransport(const Key& key) {
     return (it == mStore.end() ? nullptr : it->second.get());
 }
 
-bool DnsTlsDispatcher::Transport::checkRevalidationNecessary() {
-    if (triggerThreshold <= 0) return false;
-    if (continuousfailureCount < triggerThreshold) return false;
-    if (isRevalidationThresholdReached) return false;
+bool DnsTlsDispatcher::Transport::checkRevalidationNecessary(DnsTlsTransport::Response code) {
+    if (!revalidationEnabled) return false;
 
-    isRevalidationThresholdReached = true;
-    return true;
+    if (code == DnsTlsTransport::Response::network_error) {
+        continuousfailureCount++;
+    } else {
+        continuousfailureCount = 0;
+    }
+
+    // triggerThreshold must be greater than 0 because the value of revalidationEnabled is true.
+    if (usable() && continuousfailureCount == triggerThreshold) {
+        return true;
+    }
+    return false;
 }
 
-bool DnsTlsDispatcher::Transport::usable() {
-    if (unusableThreshold <= 0) return true;
+bool DnsTlsDispatcher::Transport::usable() const {
+    if (!revalidationEnabled) return true;
 
-    if (continuousfailureCount >= unusableThreshold) {
-        // Once reach the threshold, mark this Transport as unusable.
-        isXportUnusableThresholdReached = true;
-    }
-    return !isXportUnusableThresholdReached;
+    return continuousfailureCount < unusableThreshold;
 }
 
 }  // end of namespace net
