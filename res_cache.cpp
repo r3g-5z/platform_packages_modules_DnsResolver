@@ -802,7 +802,7 @@ static uint32_t answer_getTTL(span<const uint8_t> answer) {
         PLOG(INFO) << __func__ << ": ns_initparse failed";
     }
 
-    LOG(INFO) << __func__ << ": TTL = " << result;
+    LOG(DEBUG) << __func__ << ": TTL = " << result;
     return result;
 }
 
@@ -1124,7 +1124,7 @@ static void cache_dump_mru_locked(Cache* cache) {
         fmt::format_to(std::back_inserter(buf), " {}", e->id);
     }
 
-    LOG(INFO) << __func__ << ": " << buf;
+    LOG(DEBUG) << __func__ << ": " << buf;
 }
 
 /* This function tries to find a key within the hash table
@@ -1168,7 +1168,7 @@ static void _cache_add_p(Cache* cache, Entry** lookup, Entry* e) {
     entry_mru_add(e, &cache->mru_list);
     cache->num_entries += 1;
 
-    LOG(INFO) << __func__ << ": entry " << e->id << " added (count=" << cache->num_entries << ")";
+    LOG(DEBUG) << __func__ << ": entry " << e->id << " added (count=" << cache->num_entries << ")";
 }
 
 /* Remove an existing entry from the hash table,
@@ -1178,8 +1178,8 @@ static void _cache_add_p(Cache* cache, Entry** lookup, Entry* e) {
 static void _cache_remove_p(Cache* cache, Entry** lookup) {
     Entry* e = *lookup;
 
-    LOG(INFO) << __func__ << ": entry " << e->id << " removed (count=" << cache->num_entries - 1
-              << ")";
+    LOG(DEBUG) << __func__ << ": entry " << e->id << " removed (count=" << cache->num_entries - 1
+               << ")";
 
     entry_mru_remove(e);
     *lookup = e->hlink;
@@ -1197,7 +1197,7 @@ static void _cache_remove_oldest(Cache* cache) {
         LOG(INFO) << __func__ << ": OLDEST NOT IN HTABLE ?";
         return;
     }
-    LOG(INFO) << __func__ << ": Cache full - removing oldest";
+    LOG(DEBUG) << __func__ << ": Cache full - removing oldest";
     res_pquery({oldest->query, oldest->querylen});
     _cache_remove_p(cache, lookup);
 }
@@ -1243,7 +1243,7 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, span<const uint8_t> query,
     Entry* e;
     time_t now;
 
-    LOG(INFO) << __func__ << ": lookup";
+    LOG(DEBUG) << __func__ << ": lookup";
 
     /* we don't cache malformed queries */
     if (!entry_init_key(&key, query)) {
@@ -1265,7 +1265,7 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, span<const uint8_t> query,
     e = *lookup;
 
     if (e == NULL) {
-        LOG(INFO) << __func__ << ": NOT IN CACHE";
+        LOG(DEBUG) << __func__ << ": NOT IN CACHE";
 
         if (!cache_has_pending_request_locked(cache, &key, true)) {
             return RESOLV_CACHE_NOTFOUND;
@@ -1302,7 +1302,7 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, span<const uint8_t> query,
 
     /* remove stale entries here */
     if (now >= e->expires) {
-        LOG(INFO) << __func__ << ": NOT IN CACHE (STALE ENTRY " << *lookup << "DISCARDED)";
+        LOG(DEBUG) << __func__ << ": NOT IN CACHE (STALE ENTRY " << *lookup << "DISCARDED)";
         res_pquery({e->query, e->querylen});
         _cache_remove_p(cache, lookup);
         return RESOLV_CACHE_NOTFOUND;
@@ -1542,17 +1542,6 @@ static NetConfig* find_netconfig_locked(unsigned netid) {
     return nullptr;
 }
 
-static void resolv_set_experiment_params(res_params* params) {
-    if (params->retry_count == 0) {
-        params->retry_count = getExperimentFlagInt("retry_count", RES_DFLRETRY);
-    }
-
-    if (params->base_timeout_msec == 0) {
-        params->base_timeout_msec =
-                getExperimentFlagInt("retransmission_time_interval", RES_TIMEOUT);
-    }
-}
-
 android::net::NetworkType resolv_get_network_types_for_net(unsigned netid) {
     std::lock_guard guard(cache_mutex);
     NetConfig* netconfig = find_netconfig_locked(netid);
@@ -1642,7 +1631,7 @@ int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& serve
     std::vector<std::string> nameservers = filter_nameservers(servers);
     const int numservers = static_cast<int>(nameservers.size());
 
-    LOG(INFO) << __func__ << ": netId = " << netid << ", numservers = " << numservers;
+    LOG(DEBUG) << __func__ << ": netId = " << netid << ", numservers = " << numservers;
 
     // Parse the addresses before actually locking or changing any state, in case there is an error.
     // As a side effect this also reduces the time the lock is kept.
@@ -1660,7 +1649,20 @@ int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& serve
 
     uint8_t old_max_samples = netconfig->params.max_samples;
     netconfig->params = params;
-    resolv_set_experiment_params(&netconfig->params);
+
+    // This check must always be true, but add a protection against OEMs configure negative values
+    // for retry_count and base_timeout_msec.
+    if (netconfig->params.retry_count == 0) {
+        const int retryCount = Experiments::getInstance()->getFlag("retry_count", RES_DFLRETRY);
+        netconfig->params.retry_count = (retryCount <= 0) ? RES_DFLRETRY : retryCount;
+    }
+    if (netconfig->params.base_timeout_msec == 0) {
+        const int retransmissionInterval =
+                Experiments::getInstance()->getFlag("retransmission_time_interval", RES_TIMEOUT);
+        netconfig->params.base_timeout_msec =
+                (retransmissionInterval <= 0) ? RES_TIMEOUT : retransmissionInterval;
+    }
+
     if (!resolv_is_nameservers_equal(netconfig->nameservers, nameservers)) {
         // free current before adding new
         free_nameservers_locked(netconfig);
@@ -1730,7 +1732,7 @@ void resolv_populate_res_for_net(ResState* statp) {
     if (statp == nullptr) {
         return;
     }
-    LOG(INFO) << __func__ << ": netid=" << statp->netid;
+    LOG(DEBUG) << __func__ << ": netid=" << statp->netid;
 
     std::lock_guard guard(cache_mutex);
     NetConfig* info = find_netconfig_locked(statp->netid);
@@ -1751,8 +1753,8 @@ static void res_cache_add_stats_sample_locked(res_stats* stats, const res_sample
                                               int max_samples) {
     // Note: This function expects max_samples > 0, otherwise a (harmless) modification of the
     // allocated but supposedly unused memory for samples[0] will happen
-    LOG(INFO) << __func__ << ": adding sample to stats, next = " << unsigned(stats->sample_next)
-              << ", count = " << unsigned(stats->sample_count);
+    LOG(DEBUG) << __func__ << ": adding sample to stats, next = " << unsigned(stats->sample_next)
+               << ", count = " << unsigned(stats->sample_count);
     stats->samples[stats->sample_next] = sample;
     if (stats->sample_count < max_samples) {
         ++stats->sample_count;
@@ -1851,7 +1853,10 @@ int resolv_cache_get_resolver_stats(unsigned netid, res_params* params, res_stat
                                     const std::vector<IPSockAddr>& serverSockAddrs) {
     std::lock_guard guard(cache_mutex);
     NetConfig* info = find_netconfig_locked(netid);
-    if (!info) return -1;
+    if (!info) {
+        LOG(WARNING) << __func__ << ": NetConfig for netid " << netid << " not found";
+        return -1;
+    }
 
     for (size_t i = 0; i < serverSockAddrs.size(); i++) {
         for (size_t j = 0; j < info->nameserverSockAddrs.size(); j++) {
