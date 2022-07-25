@@ -16,9 +16,6 @@ cc_test_library {
     header_libs: [
         "libnetd_resolv_headers",
     ],
-    shared_libs: [
-        "libutils",
-    ],
     static_libs: [
         "netd_aidl_interface-lateststable-ndk",
         "libnetd_test_dnsresponder_ndk",
@@ -117,9 +114,17 @@ cc_test {
         "server_configurable_flags",
         "stats_proto",
     ],
-    // MTS test binary can't be built under compile_multilib = "both" and having test data.
-    // However, MTS coverage requires 32 bit test binary to run.
-    compile_multilib: "prefer32",
+    // TODO: Remove multilib after coverage test switched to 64-bit device.
+    // See comments in target "resolv_test_mts_coverage_defaults".
+    compile_multilib: "both",
+    multilib: {
+        lib32: {
+            suffix: "32",
+        },
+        lib64: {
+            suffix: "64",
+        },
+    },
 }
 
 cc_test {
@@ -146,7 +151,6 @@ cc_test {
         "libnetd_test_dnsresponder_ndk",
         "libnetd_test_resolv_utils",
         "libnetdutils",
-        "libutils",
         "netd_event_listener_interface-lateststable-ndk",
         "netd_aidl_interface-lateststable-ndk",
     ],
@@ -189,7 +193,7 @@ cc_test {
         "libnetd_test_resolv_utils",
         "libnetdutils",
         "libssl",
-        "libutils",
+        "libcutils",
         "netd_aidl_interface-lateststable-ndk",
         "netd_event_listener_interface-lateststable-ndk",
         "libip_checksum",
@@ -252,7 +256,6 @@ cc_test {
         "libstatslog_resolv",
         "libstatspush_compat",
         "libsysutils",
-        "libutils",
         "resolv_stats_test_utils",
         "server_configurable_flags",
         "stats_proto",
@@ -287,6 +290,7 @@ cc_test {
     test_suites: ["general-tests"],
     static_libs: [
         "libgmock",
+        "libnetdutils",
         "libprotobuf-cpp-lite",
         "resolv_stats_test_utils",
         "stats_proto",
@@ -298,7 +302,10 @@ cc_test {
     test_suites: [
         "general-tests",
     ],
-    defaults: ["netd_defaults"],
+    defaults: [
+        "netd_defaults",
+        "resolv_test_defaults",
+    ],
     header_libs: [
         "libnetd_resolv_internal_headers",
     ],
@@ -307,11 +314,10 @@ cc_test {
         "libcrypto_static",
         "libdoh_ffi_for_test",
         "libgmock",
-        "liblog",
+        "libnetdutils",
         "libssl",
     ],
     shared_libs: [
         "libnetd_client",
     ],
-    min_sdk_version: "29",
 }
