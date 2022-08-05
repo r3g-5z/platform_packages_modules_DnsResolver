@@ -70,9 +70,6 @@ using aidl::android::net::ResolverOptionsParcel;
 using android::net::DnsQueryEvent;
 using android::net::DnsStats;
 using android::net::Experiments;
-using android::net::PROTO_DOH;
-using android::net::PROTO_DOT;
-using android::net::PROTO_MDNS;
 using android::net::PROTO_TCP;
 using android::net::PROTO_UDP;
 using android::net::Protocol;
@@ -1542,17 +1539,6 @@ static NetConfig* find_netconfig_locked(unsigned netid) {
     return nullptr;
 }
 
-static void resolv_set_experiment_params(res_params* params) {
-    if (params->retry_count == 0) {
-        params->retry_count = getExperimentFlagInt("retry_count", RES_DFLRETRY);
-    }
-
-    if (params->base_timeout_msec == 0) {
-        params->base_timeout_msec =
-                getExperimentFlagInt("retransmission_time_interval", RES_TIMEOUT);
-    }
-}
-
 android::net::NetworkType resolv_get_network_types_for_net(unsigned netid) {
     std::lock_guard guard(cache_mutex);
     NetConfig* netconfig = find_netconfig_locked(netid);
@@ -1660,7 +1646,20 @@ int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& serve
 
     uint8_t old_max_samples = netconfig->params.max_samples;
     netconfig->params = params;
-    resolv_set_experiment_params(&netconfig->params);
+
+    // This check must always be true, but add a protection against OEMs configure negative values
+    // for retry_count and base_timeout_msec.
+    if (netconfig->params.retry_count == 0) {
+        const int retryCount = Experiments::getInstance()->getFlag("retry_count", RES_DFLRETRY);
+        netconfig->params.retry_count = (retryCount <= 0) ? RES_DFLRETRY : retryCount;
+    }
+    if (netconfig->params.base_timeout_msec == 0) {
+        const int retransmissionInterval =
+                Experiments::getInstance()->getFlag("retransmission_time_interval", RES_TIMEOUT);
+        netconfig->params.base_timeout_msec =
+                (retransmissionInterval <= 0) ? RES_TIMEOUT : retransmissionInterval;
+    }
+
     if (!resolv_is_nameservers_equal(netconfig->nameservers, nameservers)) {
         // free current before adding new
         free_nameservers_locked(netconfig);
@@ -1851,7 +1850,10 @@ int resolv_cache_get_resolver_stats(unsigned netid, res_params* params, res_stat
                                     const std::vector<IPSockAddr>& serverSockAddrs) {
     std::lock_guard guard(cache_mutex);
     NetConfig* info = find_netconfig_locked(netid);
-    if (!info) return -1;
+    if (!info) {
+        LOG(WARNING) << __func__ << ": NetConfig for netid " << netid << " not found";
+        return -1;
+    }
 
     for (size_t i = 0; i < serverSockAddrs.size(); i++) {
         for (size_t j = 0; j < info->nameserverSockAddrs.size(); j++) {
@@ -1933,29 +1935,16 @@ int resolv_cache_get_expiration(unsigned netid, span<const uint8_t> query, time_
     return 0;
 }
 
-static const char* protocol_to_str(const Protocol proto) {
-    switch (proto) {
-        case PROTO_UDP:
-            return "UDP";
-        case PROTO_TCP:
-            return "TCP";
-        case PROTO_DOT:
-            return "DOT";
-        case PROTO_DOH:
-            return "DOH";
-        case PROTO_MDNS:
-            return "MDNS";
-        default:
-            return "UNKNOWN";
-    }
-}
-
 int resolv_stats_set_addrs(unsigned netid, Protocol proto, const std::vector<std::string>& addrs,
                            int port) {
     std::lock_guard guard(cache_mutex);
     const auto info = find_netconfig_locked(netid);
 
-    if (info == nullptr) return -ENONET;
+    if (info == nullptr) {
+        LOG(WARNING) << __func__ << ": Network " << netid << " not found for "
+                     << Protocol_Name(proto);
+        return -ENONET;
+    }
 
     std::vector<IPSockAddr> sockAddrs;
     sockAddrs.reserve(addrs.size());
@@ -1964,8 +1953,8 @@ int resolv_stats_set_addrs(unsigned netid, Protocol proto, const std::vector<std
     }
 
     if (!info->dnsStats.setAddrs(sockAddrs, proto)) {
-        LOG(WARNING) << __func__ << ": netid = " << netid << ", failed to set "
-                     << protocol_to_str(proto) << " stats";
+        LOG(WARNING) << __func__ << ": Failed to set " << Protocol_Name(proto) << " on network "
+                     << netid;
         return -EINVAL;
     }
 

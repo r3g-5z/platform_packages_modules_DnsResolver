@@ -16,18 +16,19 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <netdutils/NetNativeTestBase.h>
 
 #include "PrivateDnsConfiguration.h"
+#include "resolv_cache.h"
 #include "tests/dns_responder/dns_responder.h"
 #include "tests/dns_responder/dns_tls_frontend.h"
-#include "tests/resolv_test_base.h"
 #include "tests/resolv_test_utils.h"
 
 namespace android::net {
 
 using namespace std::chrono_literals;
 
-class PrivateDnsConfigurationTest : public ResolvTestBase {
+class PrivateDnsConfigurationTest : public NetNativeTestBase {
   public:
     using ServerIdentity = PrivateDnsConfiguration::ServerIdentity;
 
@@ -74,7 +75,12 @@ class PrivateDnsConfigurationTest : public ResolvTestBase {
                     std::lock_guard guard(mObserver.lock);
                     mObserver.serverStateMap[server] = validation;
                 });
+
+        // Create a NetConfig for stats.
+        EXPECT_EQ(0, resolv_create_cache_for_net(kNetId));
     }
+
+    void TearDown() { resolv_delete_cache_for_net(kNetId); }
 
   protected:
     class MockObserver : public PrivateDnsValidationObserver {
@@ -118,7 +124,7 @@ class PrivateDnsConfigurationTest : public ResolvTestBase {
     }
 
     bool hasPrivateDnsServer(const ServerIdentity& identity, unsigned netId) {
-        return mPdc.getPrivateDns(identity, netId).ok();
+        return mPdc.getDotServer(identity, netId).ok();
     }
 
     static constexpr uint32_t kNetId = 30;
@@ -192,7 +198,7 @@ TEST_F(PrivateDnsConfigurationTest, Revalidation_Opportunistic) {
         backend.startServer();
     });
     backend.stopServer();
-    EXPECT_TRUE(mPdc.requestValidation(kNetId, ServerIdentity(server), kMark).ok());
+    EXPECT_TRUE(mPdc.requestDotValidation(kNetId, ServerIdentity(server), kMark).ok());
 
     t.join();
     expectPrivateDnsStatus(PrivateDnsMode::OPPORTUNISTIC);
@@ -337,18 +343,18 @@ TEST_F(PrivateDnsConfigurationTest, RequestValidation) {
             EXPECT_CALL(mObserver,
                         onValidationStateUpdate(kServer1, Validation::in_process, kNetId));
             EXPECT_CALL(mObserver, onValidationStateUpdate(kServer1, Validation::success, kNetId));
-            EXPECT_TRUE(mPdc.requestValidation(kNetId, identity, kMark).ok());
+            EXPECT_TRUE(mPdc.requestDotValidation(kNetId, identity, kMark).ok());
         } else if (config == "IN_PROGRESS") {
             EXPECT_CALL(mObserver, onValidationStateUpdate(kServer1, Validation::success, kNetId));
-            EXPECT_FALSE(mPdc.requestValidation(kNetId, identity, kMark).ok());
+            EXPECT_FALSE(mPdc.requestDotValidation(kNetId, identity, kMark).ok());
         } else if (config == "FAIL") {
-            EXPECT_FALSE(mPdc.requestValidation(kNetId, identity, kMark).ok());
+            EXPECT_FALSE(mPdc.requestDotValidation(kNetId, identity, kMark).ok());
         }
 
         // Resending the same request or requesting nonexistent servers are denied.
-        EXPECT_FALSE(mPdc.requestValidation(kNetId, identity, kMark).ok());
-        EXPECT_FALSE(mPdc.requestValidation(kNetId, identity, kMark + 1).ok());
-        EXPECT_FALSE(mPdc.requestValidation(kNetId + 1, identity, kMark).ok());
+        EXPECT_FALSE(mPdc.requestDotValidation(kNetId, identity, kMark).ok());
+        EXPECT_FALSE(mPdc.requestDotValidation(kNetId, identity, kMark + 1).ok());
+        EXPECT_FALSE(mPdc.requestDotValidation(kNetId + 1, identity, kMark).ok());
 
         // Reset the test state.
         backend.setDeferredResp(false);
