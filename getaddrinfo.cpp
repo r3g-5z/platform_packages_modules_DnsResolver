@@ -38,7 +38,6 @@
 #include <arpa/nameser.h>
 #include <assert.h>
 #include <ctype.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <net/if.h>
 #include <netdb.h>
@@ -57,6 +56,7 @@
 #include <future>
 
 #include <android-base/logging.h>
+#include <android-base/parseint.h>
 
 #include "Experiments.h"
 #include "netd_resolv/resolv.h"
@@ -64,7 +64,6 @@
 #include "res_debug.h"
 #include "resolv_cache.h"
 #include "resolv_private.h"
-#include "util.h"
 
 #define ANY 0
 
@@ -123,7 +122,6 @@ struct res_target {
     int n = 0;                                                         // result length
 };
 
-static int str2number(const char*);
 static int explore_fqdn(const struct addrinfo*, const char*, const char*, struct addrinfo**,
                         const struct android_net_context*, NetworkDnsEventReported* event);
 static int explore_null(const struct addrinfo*, const char*, struct addrinfo**);
@@ -211,22 +209,6 @@ void freeaddrinfo(struct addrinfo* ai) {
         free(ai);
         ai = next;
     }
-}
-
-static int str2number(const char* p) {
-    char* ep;
-    unsigned long v;
-
-    assert(p != NULL);
-
-    if (*p == '\0') return -1;
-    ep = NULL;
-    errno = 0;
-    v = strtoul(p, &ep, 10);
-    if (errno == 0 && ep && *ep == '\0' && v <= UINT_MAX)
-        return v;
-    else
-        return -1;
 }
 
 /*
@@ -711,7 +693,7 @@ static int get_portmatch(const struct addrinfo* ai, const char* servname) {
 static int get_port(const struct addrinfo* ai, const char* servname, int matchonly) {
     const char* proto;
     struct servent* sp;
-    int port;
+    uint port;
     int allownumeric;
 
     assert(ai != NULL);
@@ -738,10 +720,9 @@ static int get_port(const struct addrinfo* ai, const char* servname, int matchon
             return EAI_SOCKTYPE;
     }
 
-    port = str2number(servname);
-    if (port >= 0) {
+    if (android::base::ParseUint(servname, &port)) {
         if (!allownumeric) return EAI_SERVICE;
-        if (port < 0 || port > 65535) return EAI_SERVICE;
+        if (port > 65535) return EAI_SERVICE;
         port = htons(port);
     } else {
         if (ai->ai_flags & AI_NUMERICSERV) return EAI_NONAME;
@@ -788,9 +769,7 @@ static const struct afd* find_afd(int af) {
 
 // Convert a string to a scope identifier.
 static int ip6_str2scopeid(const char* scope, struct sockaddr_in6* sin6, uint32_t* scopeid) {
-    uint64_t lscopeid;
     struct in6_addr* a6;
-    char* ep;
 
     assert(scope != NULL);
     assert(sin6 != NULL);
@@ -811,14 +790,10 @@ static int ip6_str2scopeid(const char* scope, struct sockaddr_in6* sin6, uint32_
         if (*scopeid != 0) return 0;
     }
 
-    // try to convert to a numeric id as a last resort
-    errno = 0;
-    lscopeid = strtoul(scope, &ep, 10);
-    *scopeid = (uint32_t)(lscopeid & 0xffffffffUL);
-    if (errno == 0 && ep && *ep == '\0' && *scopeid == lscopeid)
-        return 0;
-    else
-        return -1;
+    /* try to convert to a numeric id as a last resort*/
+    if (!android::base::ParseUint(scope, scopeid)) return -1;
+
+    return 0;
 }
 
 /* code duplicate with gethnamaddr.c */
@@ -1344,7 +1319,9 @@ static int _find_src_addr(const struct sockaddr* addr, struct sockaddr* src_addr
  * Will leave the list unchanged if an error occurs.
  */
 
-static void _rfc6724_sort(struct addrinfo* list_sentinel, unsigned mark, uid_t uid) {
+void resolv_rfc6724_sort(struct addrinfo* list_sentinel, unsigned mark, uid_t uid) {
+    if (list_sentinel == nullptr) return;
+
     struct addrinfo* cur;
     int nelem = 0, i;
     struct addrinfo_sort_elem* elems;
@@ -1439,11 +1416,6 @@ static int dns_getaddrinfo(const char* name, const addrinfo* pai,
 
     setMdnsFlag(name, res.netid, &(res.flags));
 
-    if (isMdnsResolution(res.flags)) {
-        q.qclass |= C_UNICAST;
-        q2.qclass |= C_UNICAST;
-    }
-
     int he;
     if (res_searchN(name, &q, &res, &he) < 0) {
         // Return h_errno (he) to catch more detailed errors rather than EAI_NODATA.
@@ -1469,7 +1441,7 @@ static int dns_getaddrinfo(const char* name, const addrinfo* pai,
         return herrnoToAiErrno(he);
     }
 
-    _rfc6724_sort(&sentinel, netcontext->app_mark, netcontext->uid);
+    resolv_rfc6724_sort(&sentinel, netcontext->app_mark, netcontext->uid);
 
     *rv = sentinel.ai_next;
     return 0;
@@ -1657,13 +1629,14 @@ QueryResult doQuery(const char* name, res_target* t, ResState* res,
         if ((res_temp.netcontext_flags &
              (NET_CONTEXT_FLAG_USE_DNS_OVER_TLS | NET_CONTEXT_FLAG_USE_EDNS)) &&
             (res_temp.flags & RES_F_EDNS0ERR)) {
-            LOG(DEBUG) << __func__ << ": retry without EDNS0";
+            LOG(INFO) << __func__ << ": retry without EDNS0";
             n = res_nmkquery(QUERY, name, cl, type, {}, buf, res_temp.netcontext_flags);
             n = res_nsend(&res_temp, {buf, n}, {t->answer.data(), anslen}, &rcode, 0);
         }
     }
 
-    LOG(DEBUG) << __func__ << ": rcode=" << hp->rcode << ", ancount=" << ntohs(hp->ancount);
+    LOG(INFO) << __func__ << ": rcode=" << rcode << ", ancount=" << ntohs(hp->ancount)
+              << ", return value=" << n;
 
     t->n = n;
     return {
@@ -1785,7 +1758,7 @@ static int res_queryN(const char* name, res_target* target, ResState* res, int* 
                 retried = true;
                 goto again;
             }
-            LOG(DEBUG) << __func__ << ": rcode=" << hp->rcode << ", ancount=" << ntohs(hp->ancount);
+            LOG(INFO) << __func__ << ": rcode=" << rcode << ", ancount=" << ntohs(hp->ancount);
             continue;
         }
 
@@ -1844,8 +1817,6 @@ static int res_searchN(const char* name, res_target* target, ResState* res, int*
      * - this is not a .local mDNS lookup.
      */
     if ((!dots || (dots && !trailing_dot)) && !isMdnsResolution(res->flags)) {
-        int done = 0;
-
         /* Unfortunately we need to set stuff up before
          * the domain stuff is tried.  Will have a better
          * fix after thread pools are used.
@@ -1885,12 +1856,8 @@ static int res_searchN(const char* name, res_target* target, ResState* res, int*
                     if (hp->rcode == SERVFAIL) {
                         /* try next search element, if any */
                         got_servfail++;
-                        break;
                     }
-                    [[fallthrough]];
-                default:
-                    /* anything else implies that we're done */
-                    done++;
+                    break;
             }
         }
     }
