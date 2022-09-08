@@ -43,7 +43,6 @@ pub struct FeatureFlags {
     probe_timeout_ms: uint64_t,
     idle_timeout_ms: uint64_t,
     use_session_resumption: bool,
-    enable_early_data: bool,
 }
 
 fn wrap_validation_callback(validation_fn: ValidationCallback) -> ValidationReporter {
@@ -234,7 +233,6 @@ pub unsafe extern "C" fn doh_net_new(
             cert_path,
             idle_timeout_ms: flags.idle_timeout_ms,
             use_session_resumption: flags.use_session_resumption,
-            enable_early_data: flags.enable_early_data,
         },
         timeout: Duration::from_millis(flags.probe_timeout_ms),
     };
@@ -386,7 +384,6 @@ mod tests {
             cert_path: None,
             idle_timeout_ms: 0,
             use_session_resumption: true,
-            enable_early_data: true,
         };
 
         wrap_validation_callback(success_cb)(&info, true).await;

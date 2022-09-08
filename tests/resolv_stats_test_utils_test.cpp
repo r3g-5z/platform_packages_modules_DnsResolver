@@ -16,16 +16,12 @@
 
 #include <android-base/strings.h>
 #include <gtest/gtest.h>
-#include <netdutils/NetNativeTestBase.h>
+#include <resolv_stats_test_utils.h>
 #include <stats.pb.h>
-
-#include "resolv_stats_test_utils.h"
 
 namespace android::net {
 
-class ResolvStatsUtilsTest : public NetNativeTestBase {};
-
-TEST_F(ResolvStatsUtilsTest, NetworkDnsEventEq) {
+TEST(ResolvStatsUtils, NetworkDnsEventEq) {
     NetworkDnsEventReported event1;
     // Following fields will not be verified during the test in proto NetworkDnsEventReported.
     // So don't need to config those values: event_type, return_code, latency_micros,

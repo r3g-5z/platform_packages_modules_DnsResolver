@@ -17,14 +17,11 @@
 #include "OperationLimiter.h"
 
 #include <gtest/gtest-spi.h>
-#include <netdutils/NetNativeTestBase.h>
 
 namespace android {
 namespace netdutils {
 
-class OperationLimiterTest : public NetNativeTestBase {};
-
-TEST_F(OperationLimiterTest, limits) {
+TEST(OperationLimiter, limits) {
     OperationLimiter<int> limiter(3);
 
     EXPECT_TRUE(limiter.start(42));
@@ -53,7 +50,7 @@ TEST_F(OperationLimiterTest, limits) {
     limiter.finish(42);
 }
 
-TEST_F(OperationLimiterTest, finishWithoutStart) {
+TEST(OperationLimiter, finishWithoutStart) {
     OperationLimiter<int> limiter(1);
 
     // Will output a LOG(FATAL_WITHOUT_ABORT), but we have no way to probe this.
@@ -64,7 +61,7 @@ TEST_F(OperationLimiterTest, finishWithoutStart) {
     EXPECT_FALSE(limiter.start(42));
 }
 
-TEST_F(OperationLimiterTest, destroyWithActiveOperations) {
+TEST(OperationLimiter, destroyWithActiveOperations) {
     // The death message doesn't seem to be captured on Android.
     EXPECT_DEBUG_DEATH(
             {

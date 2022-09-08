@@ -30,28 +30,7 @@ using aidl::android::net::IDnsResolver;
 using aidl::android::net::INetd;
 using aidl::android::net::ResolverOptionsParcel;
 using aidl::android::net::ResolverParamsParcel;
-using android::base::Error;
-using android::base::Result;
 using android::net::ResolverStats;
-
-ResolverParams::Builder::Builder() {
-    // Default resolver configuration for opportunistic mode.
-    mParcel.netId = TEST_NETID;
-
-    // Default Resolver params.
-    mParcel.sampleValiditySeconds = 300;
-    mParcel.successThreshold = 25;
-    mParcel.minSamples = 8;
-    mParcel.maxSamples = 8;
-    mParcel.baseTimeoutMsec = 1000;
-    mParcel.retryCount = 2;
-
-    mParcel.servers = {kDefaultServer};
-    mParcel.domains = {kDefaultSearchDomain};
-    mParcel.tlsServers = {kDefaultServer};
-    mParcel.caCertificate = kCaCert;
-    mParcel.resolverOptions = ResolverOptionsParcel{};  // optional, must be explicitly set.
-}
 
 void DnsResponderClient::SetupMappings(unsigned numHosts, const std::vector<std::string>& domains,
                                        std::vector<Mapping>* mappings) {
@@ -68,77 +47,95 @@ void DnsResponderClient::SetupMappings(unsigned numHosts, const std::vector<std:
     }
 }
 
-Result<ResolverInfo> DnsResponderClient::getResolverInfo() {
-    std::vector<std::string> dnsServers;
-    std::vector<std::string> domains;
-    std::vector<std::string> dotServers;
-    std::vector<int32_t> params;
-    std::vector<int32_t> stats;
-    std::vector<int32_t> waitForPendingReqTimeoutCount;
-    auto rv = mDnsResolvSrv->getResolverInfo(TEST_NETID, &dnsServers, &domains, &dotServers,
-                                             &params, &stats, &waitForPendingReqTimeoutCount);
-    if (!rv.isOk()) {
-        return Error() << "getResolverInfo failed: " << rv.getMessage();
-    }
-    if (stats.size() % IDnsResolver::RESOLVER_STATS_COUNT != 0) {
-        return Error() << "Unexpected stats size: " << stats.size();
-    }
-    if (params.size() != IDnsResolver::RESOLVER_PARAMS_COUNT) {
-        return Error() << "Unexpected params size: " << params.size();
-    }
-    if (waitForPendingReqTimeoutCount.size() != 1) {
-        return Error() << "Unexpected waitForPendingReqTimeoutCount size: "
-                       << waitForPendingReqTimeoutCount.size();
-    }
+// TODO: Use SetResolverConfiguration() with ResolverParamsParcel struct directly.
+// DEPRECATED: Use SetResolverConfiguration() in new code
+ResolverParamsParcel DnsResponderClient::makeResolverParamsParcel(
+        int netId, const std::vector<int>& params, const std::vector<std::string>& servers,
+        const std::vector<std::string>& domains, const std::string& tlsHostname,
+        const std::vector<std::string>& tlsServers, const std::string& caCert) {
+    ResolverParamsParcel paramsParcel;
 
-    ResolverInfo out = {
-            .dnsServers = std::move(dnsServers),
-            .domains = std::move(domains),
-            .dotServers = std::move(dotServers),
-            .params{
-                    .sample_validity = static_cast<uint16_t>(
-                            params[IDnsResolver::RESOLVER_PARAMS_SAMPLE_VALIDITY]),
-                    .success_threshold = static_cast<uint8_t>(
-                            params[IDnsResolver::RESOLVER_PARAMS_SUCCESS_THRESHOLD]),
-                    .min_samples =
-                            static_cast<uint8_t>(params[IDnsResolver::RESOLVER_PARAMS_MIN_SAMPLES]),
-                    .max_samples =
-                            static_cast<uint8_t>(params[IDnsResolver::RESOLVER_PARAMS_MAX_SAMPLES]),
-                    .base_timeout_msec = params[IDnsResolver::RESOLVER_PARAMS_BASE_TIMEOUT_MSEC],
-                    .retry_count = params[IDnsResolver::RESOLVER_PARAMS_RETRY_COUNT],
-            },
-            .stats = {},
-            .waitForPendingReqTimeoutCount = waitForPendingReqTimeoutCount[0],
+    paramsParcel.netId = netId;
+    paramsParcel.sampleValiditySeconds = params[IDnsResolver::RESOLVER_PARAMS_SAMPLE_VALIDITY];
+    paramsParcel.successThreshold = params[IDnsResolver::RESOLVER_PARAMS_SUCCESS_THRESHOLD];
+    paramsParcel.minSamples = params[IDnsResolver::RESOLVER_PARAMS_MIN_SAMPLES];
+    paramsParcel.maxSamples = params[IDnsResolver::RESOLVER_PARAMS_MAX_SAMPLES];
+    if (params.size() > IDnsResolver::RESOLVER_PARAMS_BASE_TIMEOUT_MSEC) {
+        paramsParcel.baseTimeoutMsec = params[IDnsResolver::RESOLVER_PARAMS_BASE_TIMEOUT_MSEC];
+    } else {
+        paramsParcel.baseTimeoutMsec = 0;
+    }
+    if (params.size() > IDnsResolver::RESOLVER_PARAMS_RETRY_COUNT) {
+        paramsParcel.retryCount = params[IDnsResolver::RESOLVER_PARAMS_RETRY_COUNT];
+    } else {
+        paramsParcel.retryCount = 0;
+    }
+    paramsParcel.servers = servers;
+    paramsParcel.domains = domains;
+    paramsParcel.tlsName = tlsHostname;
+    paramsParcel.tlsServers = tlsServers;
+    paramsParcel.tlsFingerprints = {};
+    paramsParcel.caCertificate = caCert;
+    paramsParcel.resolverOptions = ResolverOptionsParcel{};  // optional, must be explicitly set.
+
+    // Note, do not remove this otherwise the ResolverTest#ConnectTlsServerTimeout won't pass in M4
+    // module.
+    // TODO: remove after 2020-01 rolls out.
+    paramsParcel.tlsConnectTimeoutMs = 1000;
+
+    return paramsParcel;
+}
+
+bool DnsResponderClient::GetResolverInfo(aidl::android::net::IDnsResolver* dnsResolverService,
+                                         unsigned netId, std::vector<std::string>* servers,
+                                         std::vector<std::string>* domains,
+                                         std::vector<std::string>* tlsServers, res_params* params,
+                                         std::vector<ResolverStats>* stats,
+                                         int* waitForPendingReqTimeoutCount) {
+    using aidl::android::net::IDnsResolver;
+    std::vector<int32_t> params32;
+    std::vector<int32_t> stats32;
+    std::vector<int32_t> waitForPendingReqTimeoutCount32{0};
+    auto rv = dnsResolverService->getResolverInfo(netId, servers, domains, tlsServers, &params32,
+                                                  &stats32, &waitForPendingReqTimeoutCount32);
+
+    if (!rv.isOk() || params32.size() != static_cast<size_t>(IDnsResolver::RESOLVER_PARAMS_COUNT)) {
+        return false;
+    }
+    *params = res_params{
+            .sample_validity =
+                    static_cast<uint16_t>(params32[IDnsResolver::RESOLVER_PARAMS_SAMPLE_VALIDITY]),
+            .success_threshold =
+                    static_cast<uint8_t>(params32[IDnsResolver::RESOLVER_PARAMS_SUCCESS_THRESHOLD]),
+            .min_samples =
+                    static_cast<uint8_t>(params32[IDnsResolver::RESOLVER_PARAMS_MIN_SAMPLES]),
+            .max_samples =
+                    static_cast<uint8_t>(params32[IDnsResolver::RESOLVER_PARAMS_MAX_SAMPLES]),
+            .base_timeout_msec = params32[IDnsResolver::RESOLVER_PARAMS_BASE_TIMEOUT_MSEC],
+            .retry_count = params32[IDnsResolver::RESOLVER_PARAMS_RETRY_COUNT],
     };
-    ResolverStats::decodeAll(stats, &out.stats);
-
-    return std::move(out);
+    *waitForPendingReqTimeoutCount = waitForPendingReqTimeoutCount32[0];
+    return ResolverStats::decodeAll(stats32, stats);
 }
 
 bool DnsResponderClient::SetResolversForNetwork(const std::vector<std::string>& servers,
                                                 const std::vector<std::string>& domains,
-                                                std::vector<int> params) {
-    params.resize(IDnsResolver::RESOLVER_PARAMS_COUNT);
-    std::array<int, IDnsResolver::RESOLVER_PARAMS_COUNT> arr;
-    std::copy_n(params.begin(), arr.size(), arr.begin());
-    const auto resolverParams = ResolverParams::Builder()
-                                        .setDomains(domains)
-                                        .setDnsServers(servers)
-                                        .setDotServers({})
-                                        .setParams(arr)
-                                        .build();
+                                                const std::vector<int>& params) {
+    const auto& resolverParams =
+            makeResolverParamsParcel(TEST_NETID, params, servers, domains, "", {}, "");
     const auto rv = mDnsResolvSrv->setResolverConfiguration(resolverParams);
     return rv.isOk();
 }
 
-bool DnsResponderClient::SetResolversForNetwork(const std::vector<std::string>& servers,
-                                                const std::vector<std::string>& domains) {
-    const auto resolverParams = ResolverParams::Builder()
-                                        .setDomains(domains)
-                                        .setDnsServers(servers)
-                                        .setDotServers({})
-                                        .build();
+bool DnsResponderClient::SetResolversWithTls(const std::vector<std::string>& servers,
+                                             const std::vector<std::string>& domains,
+                                             const std::vector<int>& params,
+                                             const std::vector<std::string>& tlsServers,
+                                             const std::string& name) {
+    const auto& resolverParams = makeResolverParamsParcel(TEST_NETID, params, servers, domains,
+                                                          name, tlsServers, kCaCert);
     const auto rv = mDnsResolvSrv->setResolverConfiguration(resolverParams);
+    if (!rv.isOk()) LOG(ERROR) << "SetResolversWithTls() -> " << rv.getMessage();
     return rv.isOk();
 }
 
@@ -149,7 +146,9 @@ bool DnsResponderClient::SetResolversFromParcel(const ResolverParamsParcel& reso
 }
 
 ResolverParamsParcel DnsResponderClient::GetDefaultResolverParamsParcel() {
-    return ResolverParams::Builder().build();
+    return makeResolverParamsParcel(TEST_NETID, kDefaultParams, kDefaultServers,
+                                    kDefaultSearchDomains, {} /* tlsHostname */, kDefaultServers,
+                                    kCaCert);
 }
 
 void DnsResponderClient::SetupDNSServers(unsigned numServers, const std::vector<Mapping>& mappings,

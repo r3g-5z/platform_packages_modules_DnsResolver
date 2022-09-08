@@ -102,15 +102,6 @@ int DohFrontend::resumedConnections() const {
     return stats.resumed_connections;
 }
 
-int DohFrontend::earlyDataConnections() const {
-    std::lock_guard guard(mMutex);
-    if (!mRustDoh) return 0;
-
-    rust::Stats stats;
-    rust::frontend_stats(mRustDoh, &stats);
-    return stats.early_data_connections;
-}
-
 void DohFrontend::clearQueries() {
     std::lock_guard guard(mMutex);
     if (mRustDoh) {

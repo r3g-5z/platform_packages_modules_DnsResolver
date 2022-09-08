@@ -46,8 +46,13 @@ class Experiments {
     void updateInternal() EXCLUDES(mMutex);
     mutable std::mutex mMutex;
     std::map<std::string_view, int> mFlagsMapInt GUARDED_BY(mMutex);
-    // Sort the list by alphabet ordering.
+    // TODO: Migrate other experiment flags to here.
+    // (retry_count, retransmission_time_interval)
     static constexpr const char* const kExperimentFlagKeyList[] = {
+            "keep_listening_udp",
+            "parallel_lookup_release",
+            "parallel_lookup_sleep_time",
+            "sort_nameservers",
             "dot_async_handshake",
             "dot_connect_timeout_ms",
             "dot_maxtries",
@@ -58,19 +63,12 @@ class Experiments {
             "dot_validation_latency_factor",
             "dot_validation_latency_offset_ms",
             "doh",
-            "doh_early_data",
             "doh_query_timeout_ms",
             "doh_probe_timeout_ms",
             "doh_idle_timeout_ms",
             "doh_session_resumption",
-            "keep_listening_udp",
-            "max_queries_global",
             "mdns_resolution",
-            "parallel_lookup_release",
-            "parallel_lookup_sleep_time",
-            "retransmission_time_interval",
-            "retry_count",
-            "sort_nameservers",
+            "max_queries_global",
     };
     // This value is used in updateInternal as the default value if any flags can't be found.
     static constexpr int kFlagIntDefault = INT_MIN;

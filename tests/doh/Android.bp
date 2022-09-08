@@ -19,6 +19,7 @@ rust_ffi_static {
         "libandroid_logger",
         "libanyhow",
         "libquiche",
+        "libring",
         "liblazy_static",
         "libtokio",
         "libbase64_rust",
